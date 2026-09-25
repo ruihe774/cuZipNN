@@ -61,7 +61,7 @@ def _raw_bytes(k: int, nch: int, n: int, chunk_bytes: int, device) -> torch.Tens
     """Uncompressed size of each (stream, chunk): chunk_bytes, except for each stream's last chunk."""
     raw = torch.full((k, nch), chunk_bytes, dtype=torch.int64, device=device)
     raw[:, -1] = n - (nch - 1) * chunk_bytes
-    return raw.view(-1)
+    return raw.flatten()
 
 
 def _layout(ndim: int, total: int, n_comp: int):
@@ -88,11 +88,9 @@ def compress_tensor(
         raise ValueError(f"at most {_MAX_NDIM} dimensions are supported")
 
     x = tensor.detach()
-    if not x.is_cuda:
-        x = x.cuda()
-    device = x.device
+    device = x.device if x.is_cuda else torch.device("cuda", torch.cuda.current_device())
     with torch.cuda.device(device):
-        x = x.contiguous().view(-1)
+        x = x.to(device).flatten()
         k, n, reorder = x.element_size(), x.numel(), x.dtype in _REORDER
         nch = triton.cdiv(n, chunk_bytes)
         total = k * nch
@@ -134,7 +132,7 @@ def compress_tensor(
         padded = _align8(stored)
         starts = torch.cumsum(padded, 0) - padded
         n_comp, data_bytes = torch.stack([use.sum(), starts[-1] + padded[-1]]).tolist()
-        comp_idx = torch.nonzero_static(use, size=n_comp).view(-1)
+        comp_idx = torch.nonzero_static(use, size=n_comp).flatten()
 
         sizes_off, idx_off, data_off = _layout(tensor.dim(), total, n_comp)
         blob = torch.empty(data_off + data_bytes, dtype=torch.uint8, device=device)
@@ -179,7 +177,8 @@ def decompress_tensor(
         device = (
             blob.device if blob.is_cuda else torch.device("cuda", torch.cuda.current_device())
         )
-    device = torch.device(device)
+    else:
+        device = torch.device(device)
     with torch.cuda.device(device):
         out = torch.empty(shape, dtype=dtype, device=device)
         if n == 0:
@@ -203,7 +202,7 @@ def decompress_tensor(
 
         # Single-stream dtypes decode straight into the output; others go through a planar buffer.
         planar = (
-            out.view(-1).view(torch.uint8)
+            out.flatten().view(torch.uint8)
             if k == 1
             else torch.empty(total * chunk_bytes, dtype=torch.uint8, device=device)
         )
@@ -230,5 +229,5 @@ def decompress_tensor(
         else:
             # Each stream's chunk comes from the planar buffer if ANS-decoded, else straight from the blob.
             tbl = src.index_copy(0, comp_idx, slots[comp_idx])
-            _kernels.merge(tbl, out.view(-1), chunk_bytes, reorder)
+            _kernels.merge(tbl, out.flatten(), chunk_bytes, reorder)
         return out
