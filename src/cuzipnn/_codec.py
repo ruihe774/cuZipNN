@@ -90,7 +90,7 @@ def compress_tensor(
     x = tensor.detach()
     device = x.device if x.is_cuda else torch.device("cuda", torch.cuda.current_device())
     with torch.cuda.device(device):
-        x = x.to(device).flatten()
+        x = x.to(device, non_blocking=True).flatten()
         k, n, reorder = x.element_size(), x.numel(), x.dtype in _REORDER
         nch = triton.cdiv(n, chunk_bytes)
         total = k * nch
@@ -106,7 +106,9 @@ def compress_tensor(
         ) + struct.pack(f"<{tensor.dim()}q", *tensor.shape)
 
         if n == 0:
-            return torch.frombuffer(bytearray(header), dtype=torch.uint8).to(device)
+            return torch.frombuffer(bytearray(header), dtype=torch.uint8).to(
+                device, non_blocking=True
+            )
 
         # Bit reordering + byte grouping into K contiguous streams of nch chunks each.
         if k == 1 and x.data_ptr() % 8 == 0:
@@ -137,7 +139,9 @@ def compress_tensor(
         sizes_off, idx_off, data_off = _layout(tensor.dim(), total, n_comp)
         blob = torch.empty(data_off + data_bytes, dtype=torch.uint8, device=device)
         header = header[:12] + struct.pack("<I", n_comp) + header[16:]
-        blob[:sizes_off].copy_(torch.frombuffer(bytearray(header), dtype=torch.uint8))
+        blob[:sizes_off].copy_(
+            torch.frombuffer(bytearray(header), dtype=torch.uint8), non_blocking=True
+        )
         blob[sizes_off:idx_off].view(torch.int32).copy_(stored)
         blob[idx_off : idx_off + 4 * n_comp].view(torch.int32).copy_(comp_idx)
         blob[idx_off + 4 * n_comp : data_off].zero_()
