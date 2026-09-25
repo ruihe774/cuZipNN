@@ -118,12 +118,21 @@ def compress_tensor(
             _kernels.split(x, planar, nch * chunk_bytes, reorder)
 
         # Entropy-code every (stream, chunk) in one nvCOMP batch.
-        idx = torch.arange(total, dtype=torch.int64, device=device)
         raw = _raw_bytes(k, nch, n, chunk_bytes, device)
-        in_ptrs = planar.data_ptr() + idx * chunk_bytes
+        in_start = planar.data_ptr()
+        in_ptrs = torch.arange(
+            in_start,
+            in_start + total * chunk_bytes,
+            chunk_bytes,
+            dtype=torch.int64,
+            device=device,
+        )
         slot = _align8(_nvcomp.max_compressed_chunk_bytes(chunk_bytes))
         comp = torch.empty(total * slot, dtype=torch.uint8, device=device)
-        out_ptrs = comp.data_ptr() + idx * slot
+        out_start = comp.data_ptr()
+        out_ptrs = torch.arange(
+            out_start, out_start + total * slot, slot, dtype=torch.int64, device=device
+        )
         comp_bytes = torch.empty(total, dtype=torch.int64, device=device)
         statuses = torch.empty(total, dtype=torch.int32, device=device)
         _nvcomp.compress(in_ptrs, raw, chunk_bytes, k * n, out_ptrs, comp_bytes, statuses)
