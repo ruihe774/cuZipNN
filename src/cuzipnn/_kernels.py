@@ -99,7 +99,7 @@ def _copy_chunks_kernel(src_tbl, dst_tbl, nbytes_ptr, PAD: tl.constexpr, BLOCK: 
                 tl.store(dst.to(tl.pointer_type(tl.uint8)) + k, b, mask=k < nb)
 
 
-_SPLIT_BLOCK = 4096
+_SPLIT_BLOCK = 1024
 _MERGE_BLOCK = 4096
 _COPY_BLOCK = 1024  # 8-byte words
 
