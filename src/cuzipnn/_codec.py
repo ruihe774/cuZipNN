@@ -16,6 +16,7 @@ Chunk j of every stream covers elements [j * chunk_bytes, (j + 1) * chunk_bytes)
 
 import ctypes
 import struct
+from collections.abc import Buffer
 
 import torch
 import triton
@@ -244,8 +245,9 @@ def compress_tensor(
 
 
 def _parse_header(
-    prefix: bytes,
+    prefix: Buffer,
 ) -> tuple[torch.dtype, tuple[int, ...], bool, int, int, int]:
+    prefix = memoryview(prefix)
     if len(prefix) < _FIXED.size:
         raise ValueError("blob is too short")
     magic, version, code, ndim, flags, chunk_bytes, n_comp, n = _FIXED.unpack_from(prefix)
@@ -275,7 +277,7 @@ def decompress_tensor(
     prefix_tensor = (
         blob[:prefix_len].to("cpu", memory_format=torch.contiguous_format).contiguous()
     )
-    prefix = ctypes.string_at(prefix_tensor.data_ptr(), prefix_len)
+    prefix = (ctypes.c_byte * prefix_len).from_address(prefix_tensor.data_ptr())
     dtype, shape, reorder, chunk_bytes, n_comp, n = _parse_header(prefix)
 
     device = (
