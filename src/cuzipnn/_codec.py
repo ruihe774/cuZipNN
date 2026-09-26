@@ -396,8 +396,8 @@ def decompress_tensor(
                 )
         else:
             # Each stream's chunk comes from the planar buffer if ANS-decoded, else straight from the blob.
-            tbl = src.index_copy(0, comp_idx, slots[comp_idx])
-            _kernels.merge(tbl, out.view(-1), chunk_bytes, reorder)
+            tbl = src.index_copy(0, comp_idx, slots[comp_idx]) - planar_base
+            _kernels.merge(tbl, planar, out.view(-1), chunk_bytes, reorder)
 
         current_stream.wait_stream(stream)
         if uploaded is not None:

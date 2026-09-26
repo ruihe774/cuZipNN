@@ -54,8 +54,33 @@ def _split_kernel(
 
 
 @triton.jit
+def _merge_streams(
+    src_tbl,
+    base_ptr,
+    out_ptr,
+    j,
+    nch,
+    offs,
+    e,
+    mask,
+    K: tl.constexpr,
+    WT: tl.constexpr,
+    REORDER: tl.constexpr,
+):
+    u = tl.zeros(offs.shape, WT)
+    for b in tl.static_range(K):  # pyright: ignore[reportGeneralTypeIssues]
+        # Every chunk starts 8-byte aligned; the hint lets Triton vectorize the byte loads.
+        src = base_ptr + tl.multiple_of(tl.load(src_tbl + b * nch + j), 8)
+        u |= tl.load(src + offs, mask=mask, other=0).to(WT) << (8 * b)
+    if REORDER:
+        u = _revert(u, 8 * K)
+    tl.store(out_ptr + e, u.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
 def _merge_kernel(
     src_tbl,
+    base_ptr,
     out_ptr,
     n,
     nch,
@@ -65,18 +90,18 @@ def _merge_kernel(
     REORDER: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Inverse of _split_kernel for chunk j; src_tbl[b * nch + j] is the address of stream b's chunk j."""
+    """Inverse of _split_kernel for chunk j; stream b's chunk j is at base_ptr + src_tbl[b * nch + j]."""
     j = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     e = j.to(tl.int64) * C + offs
-    mask = (offs < C) & (e < n)
-    u = tl.zeros((BLOCK,), WT)
-    for b in tl.static_range(K):  # pyright: ignore[reportGeneralTypeIssues]
-        src = tl.load(src_tbl + b * nch + j).to(tl.pointer_type(tl.uint8))
-        u |= tl.load(src + offs, mask=mask, other=0).to(WT) << (8 * b)
-    if REORDER:
-        u = _revert(u, 8 * K)
-    tl.store(out_ptr + e, u.to(out_ptr.dtype.element_ty), mask=mask)
+    # Only the last chunk can be partial. Masking the others by C alone keeps their accesses
+    # vectorized even when n is not a multiple of the vector width.
+    if j < nch - 1:
+        _merge_streams(src_tbl, base_ptr, out_ptr, j, nch, offs, e, offs < C, K, WT, REORDER)
+    else:
+        _merge_streams(
+            src_tbl, base_ptr, out_ptr, j, nch, offs, e, (offs < C) & (e < n), K, WT, REORDER
+        )
 
 
 def split(x: torch.Tensor, planar: torch.Tensor, stride: int, reorder: bool) -> None:
@@ -96,13 +121,21 @@ def split(x: torch.Tensor, planar: torch.Tensor, stride: int, reorder: bool) -> 
     )
 
 
-def merge(src_tbl: torch.Tensor, out: torch.Tensor, chunk_bytes: int, reorder: bool) -> None:
+def merge(
+    src_tbl: torch.Tensor,
+    base: torch.Tensor,
+    out: torch.Tensor,
+    chunk_bytes: int,
+    reorder: bool,
+) -> None:
+    """src_tbl holds int64 byte offsets from base.data_ptr(), each a multiple of 8."""
     n = out.numel()
     k = out.element_size()
     nch = triton.cdiv(n, chunk_bytes)
     grid = (nch, triton.cdiv(min(chunk_bytes, n), _MERGE_BLOCK))
     _merge_kernel[grid](
         src_tbl,
+        base,
         out.view(_UNSIGNED[k]),
         n,
         nch,
@@ -111,5 +144,6 @@ def merge(src_tbl: torch.Tensor, out: torch.Tensor, chunk_bytes: int, reorder: b
         WT=_word_type(k),
         REORDER=reorder,
         BLOCK=_MERGE_BLOCK,
-        num_warps=8,  # pyright: ignore[reportCallIssue]
+        # 4 elements per thread; 2-5% faster than 8 warps for 2/4/8-byte dtypes on GB10.
+        num_warps=32,  # pyright: ignore[reportCallIssue]
     )
