@@ -248,6 +248,52 @@ def test_bad_blob():
         decompress_tensor(torch.zeros(64, dtype=torch.uint8))
 
 
+def _mixed_int8(n_chunks):
+    # Alternating incompressible and compressible chunks, plus a short raw tail.
+    parts = [
+        torch.randint(0, 256, (CHUNK,), dtype=torch.uint8)
+        if i % 2 == 0
+        else torch.zeros(CHUNK, dtype=torch.uint8)
+        for i in range(n_chunks)
+    ]
+    return torch.cat(parts + [torch.randint(0, 256, (13,), dtype=torch.uint8)]).cuda()
+
+
+@pytest.mark.parametrize("layout", ["offset", "strided", "offset_in_misaligned_storage"])
+def test_unaligned_cpu_blob_view(layout):
+    x = _mixed_int8(7)
+    blob = compress_tensor(x, chunk_bytes=CHUNK)
+    if layout == "offset":
+        view = torch.cat([torch.zeros(3, dtype=torch.uint8), blob])[3:]
+    elif layout == "strided":
+        view = torch.stack([blob, blob], 1)[:, 0]
+    else:
+        # The storage starts 3 bytes into the buffer, so the view's address is 4-byte aligned
+        # but its storage offset (1) is not.
+        buf = bytearray(blob.numel() + 4)
+        buf[4:] = blob.numpy().tobytes()
+        view = torch.frombuffer(memoryview(buf)[3:], dtype=torch.uint8)[1:]
+    assert torch.equal(decompress_tensor(view), x)
+
+
+def test_truncated_data_section():
+    blob = compress_tensor(_mixed_int8(7), chunk_bytes=CHUNK)
+    with pytest.raises(ValueError, match="truncated"):
+        decompress_tensor(blob[:-8])
+
+
+def test_raw_chunk_with_wrong_size():
+    blob = compress_tensor(_mixed_int8(7), chunk_bytes=CHUNK)
+    sizes_off, _, _ = _codec._layout(1, 0, 0)
+    # Shrink the raw 13-byte tail (chunk 7) within its 8-byte padding, so no chunk moves; moving
+    # the ANS chunks would hand nvCOMP garbage, which it does not survive.
+    stored = blob[sizes_off + 4 * 7 : sizes_off + 4 * 8].view(torch.int32)
+    assert stored.item() == 13
+    stored -= 1
+    with pytest.raises(ValueError, match="raw chunk"):
+        decompress_tensor(blob)
+
+
 def _zipnn_reference_streams(x: torch.Tensor, reorder: bool) -> torch.Tensor:
     """Reorder + byte grouping as in ZipNN's csrc/data_manipulation_dtype{16,32}.c."""
     k = x.element_size()

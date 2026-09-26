@@ -1,4 +1,4 @@
-"""Triton kernels for ZipNN's bit reordering, byte grouping, and chunk packing."""
+"""Triton kernels for ZipNN's bit reordering and byte grouping."""
 
 import torch
 import triton
@@ -71,35 +71,8 @@ def _merge_kernel(
     tl.store(out_ptr + e, u.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit
-def _copy_chunks_kernel(src_tbl, dst_tbl, nbytes_ptr, PAD: tl.constexpr, BLOCK: tl.constexpr):
-    """Copy chunk i (nbytes[i] bytes) from src_tbl[i] to dst_tbl[i]; both addresses are 8-byte aligned.
-
-    With PAD, the destination is zero-filled up to the next multiple of 8 bytes.
-    """
-    i = tl.program_id(0)
-    t = tl.program_id(1)
-    nb = tl.load(nbytes_ptr + i)
-    if t * BLOCK * 8 < nb:
-        src = tl.load(src_tbl + i)
-        dst = tl.load(dst_tbl + i)
-        nw = nb // 8
-        w = t * BLOCK + tl.arange(0, BLOCK)
-        m = w < nw
-        v = tl.load(src.to(tl.pointer_type(tl.uint64)) + w, mask=m)
-        tl.store(dst.to(tl.pointer_type(tl.uint64)) + w, v, mask=m)
-        if (nb > nw * 8) & (t == nw // BLOCK):
-            k = nw * 8 + tl.arange(0, 8)
-            b = tl.load(src.to(tl.pointer_type(tl.uint8)) + k, mask=k < nb, other=0)
-            if PAD:
-                tl.store(dst.to(tl.pointer_type(tl.uint8)) + k, b)
-            else:
-                tl.store(dst.to(tl.pointer_type(tl.uint8)) + k, b, mask=k < nb)
-
-
 _SPLIT_BLOCK = 1024
 _MERGE_BLOCK = 4096
-_COPY_BLOCK = 1024  # 8-byte words
 
 
 def _word_type(k: int):
@@ -139,14 +112,3 @@ def merge(src_tbl: torch.Tensor, out: torch.Tensor, chunk_bytes: int, reorder: b
         BLOCK=_MERGE_BLOCK,
         num_warps=8,
     )
-
-
-def copy_chunks(
-    src_tbl: torch.Tensor,
-    dst_tbl: torch.Tensor,
-    nbytes: torch.Tensor,
-    max_bytes: int,
-    pad: bool,
-) -> None:
-    grid = (src_tbl.numel(), triton.cdiv(max_bytes, 8 * _COPY_BLOCK))
-    _copy_chunks_kernel[grid](src_tbl, dst_tbl, nbytes, PAD=pad, BLOCK=_COPY_BLOCK, num_warps=4)

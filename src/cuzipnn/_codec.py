@@ -260,21 +260,25 @@ def decompress_tensor(
 
     The result is placed on `device` (default: the blob's device if it is on the GPU, else the current CUDA device).
     Decoding always runs on the GPU; a non-CUDA `device` such as "cpu" receives a copy of the result.
+
+    Passing a blob that is not from `compress_tensor` results in undefined behavior.
     """
     if blob.dtype != torch.uint8 or blob.dim() != 1:
         raise ValueError("blob must be a 1-D uint8 tensor")
 
-    x = blob.detach()
-    prefix_len = min(x.numel(), _FIXED.size + 8 * _MAX_NDIM)
-    prefix_tensor = x[:prefix_len].to("cpu", memory_format=torch.contiguous_format).contiguous()
+    blob = blob.detach()
+    prefix_len = min(blob.numel(), _FIXED.size + 8 * _MAX_NDIM)
+    prefix_tensor = (
+        blob[:prefix_len].to("cpu", memory_format=torch.contiguous_format).contiguous()
+    )
     prefix = (ctypes.c_byte * prefix_len).from_address(prefix_tensor.data_ptr())
     dtype, shape, reorder, chunk_bytes, n_comp, n = _parse_header(prefix)
 
     device = (
         torch.device(device)
         if device is not None
-        else x.device
-        if x.is_cuda
+        else blob.device
+        if blob.is_cuda
         else torch.device("cuda", torch.cuda.current_device())
     )
     # Decode on the GPU regardless; a non-CUDA target gets a copy at the end.
@@ -286,6 +290,26 @@ def decompress_tensor(
         return torch.empty(shape, dtype=dtype, device=out_device)
     out = torch.empty(shape, dtype=dtype, device=device)
 
+    k = out.element_size()
+    nch = triton.cdiv(n, chunk_bytes)
+    total = k * nch
+    sizes_off, idx_off, data_off = _layout(len(shape), total, n_comp)
+    if blob.numel() < data_off:
+        raise ValueError("blob is truncated")
+    if k == 1:
+        table = (
+            blob[sizes_off : idx_off + 4 * n_comp]
+            .to("cpu", memory_format=torch.contiguous_format)
+            .contiguous()
+        )
+        if table.storage_offset() % 4:
+            table = table.clone()
+        stored_cpu = table[: 4 * total].view(torch.int32).to(torch.int64)
+        padded_cpu = _align8(stored_cpu)
+        # nvCOMP reads the compressed chunks, so the data section must be complete before it runs.
+        if blob.numel() < data_off + padded_cpu.sum().item():
+            raise ValueError("blob is truncated")
+
     current_stream = torch.cuda.current_stream(device)
     if current_stream.cuda_stream != 0:
         stream = current_stream
@@ -294,16 +318,11 @@ def decompress_tensor(
         stream.wait_stream(current_stream)
 
     with torch.cuda.stream(stream):
-        x = x.to(device, non_blocking=True, memory_format=torch.contiguous_format).contiguous()
+        x = blob.to(
+            device, non_blocking=True, memory_format=torch.contiguous_format
+        ).contiguous()
         if x.data_ptr() % 8:
             x = x.clone()
-
-        k = out.element_size()
-        nch = triton.cdiv(n, chunk_bytes)
-        total = k * nch
-        sizes_off, idx_off, data_off = _layout(len(shape), total, n_comp)
-        if x.numel() < data_off:
-            raise ValueError("blob is truncated")
 
         stored = x[sizes_off:idx_off].view(torch.int32).to(torch.int64)
         comp_idx = x[idx_off : idx_off + 4 * n_comp].view(torch.int32).to(torch.int64)
@@ -338,10 +357,34 @@ def decompress_tensor(
             )
 
         if k == 1:
-            # Copy the raw chunks into place; the ANS chunks are already there.
-            _kernels.copy_chunks(
-                src, slots, raw.index_fill(0, comp_idx, 0), chunk_bytes, pad=False
-            )
+            # Copy the raw chunks into place; nvCOMP decodes the ANS chunks into their slots.
+            # The copy tables are built on the CPU, from a small copy of the blob's chunk table.
+            is_raw = torch.ones(total, dtype=torch.bool, device="cpu")
+            is_raw[table[4 * total :].view(torch.int32)] = False
+            raw_cpu = _raw_bytes(k, nch, n, chunk_bytes, 1, "cpu")
+            if not torch.equal(stored_cpu[is_raw], raw_cpu[is_raw]):
+                raise ValueError("blob is corrupt: a raw chunk has the wrong size")
+            src_cpu = x.data_ptr() + data_off + (torch.cumsum(padded_cpu, 0) - padded_cpu)
+            raw_src = src_cpu[is_raw]
+            raw_dst = torch.arange(
+                planar_base,
+                planar_base + total * chunk_bytes,
+                chunk_bytes,
+                dtype=torch.int64,
+                device="cpu",
+            )[is_raw]
+            raw_size = padded_cpu[is_raw]
+            if raw_size.numel():
+                # One copy per run of raw chunks that are back to back in both the blob and the output.
+                head = torch.ones(raw_size.numel(), dtype=torch.bool, device="cpu")
+                head[1:] = raw_src[:-1] + raw_size[:-1] != raw_src[1:]
+                last = head.roll(-1)
+                _cudart.memcpy_batch(
+                    raw_dst[head],
+                    raw_src[head],
+                    raw_dst[last] + raw_size[last] - raw_dst[head],
+                    stream,
+                )
         else:
             # Each stream's chunk comes from the planar buffer if ANS-decoded, else straight from the blob.
             tbl = src.index_copy(0, comp_idx, slots[comp_idx])
