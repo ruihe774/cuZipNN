@@ -18,6 +18,7 @@ url = "https://download.pytorch.org/whl/cu132"
 
 [dependency-groups]
 dev = [
+    "pyright",
     "pytest",
     "ruff",
 ]
