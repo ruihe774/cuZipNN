@@ -29,6 +29,7 @@ _FLAG_REORDER = 1
 _MAX_NDIM = 64
 
 DEFAULT_CHUNK_BYTES = 128 * 1024
+DEFAULT_SUB_CHUNK_BYTES = 8 * 1024
 DEFAULT_THRESHOLD = 0.95
 
 _DTYPES = {
@@ -67,6 +68,12 @@ def _raw_bytes(
     return raw.flatten()
 
 
+def _sub_chunks(chunk_bytes: int, sub_chunk_bytes: int) -> int:
+    """nvCOMP's sub-chunk count: chunk_bytes / sub_chunk_bytes, rounded up to a power of 2 in [4, 64]."""
+    count = 1 << (triton.cdiv(chunk_bytes, sub_chunk_bytes) - 1).bit_length()
+    return min(max(count, _nvcomp.MIN_SUB_CHUNKS), _nvcomp.MAX_SUB_CHUNKS)
+
+
 def _layout(ndim: int, total: int, n_comp: int):
     sizes_off = 24 + 8 * ndim
     idx_off = sizes_off + 4 * total
@@ -78,6 +85,7 @@ def compress_tensor(
     tensor: torch.Tensor,
     *,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    sub_chunk_bytes: int = DEFAULT_SUB_CHUNK_BYTES,
     threshold: float = DEFAULT_THRESHOLD,
     pin_memory: bool = False,
 ) -> torch.Tensor:
@@ -88,6 +96,9 @@ def compress_tensor(
         raise ValueError(
             f"chunk_bytes must be a multiple of 8 in (0, {_nvcomp.MAX_CHUNK_BYTES}]"
         )
+    if sub_chunk_bytes <= 0:
+        raise ValueError("sub_chunk_bytes must be positive")
+    sub_chunks = _sub_chunks(chunk_bytes, sub_chunk_bytes)
     if tensor.dim() > _MAX_NDIM:
         raise ValueError(f"at most {_MAX_NDIM} dimensions are supported")
 
@@ -159,7 +170,7 @@ def compress_tensor(
             dtype=torch.int64,
             device=device,
         )
-        slot = _align8(_nvcomp.max_compressed_chunk_bytes(chunk_bytes))
+        slot = _align8(_nvcomp.max_compressed_chunk_bytes(chunk_bytes, sub_chunks))
         # Zeroed: nvCOMP's rANS leaves some bytes within comp_bytes unwritten, which would
         # otherwise leak stale device memory into the blob and make it non-deterministic.
         comp = torch.zeros(total * slot, dtype=torch.uint8, device=device)
@@ -178,6 +189,7 @@ def compress_tensor(
             out_ptrs,
             comp_bytes,
             statuses,
+            sub_chunks,
             stream.cuda_stream,
         )
 

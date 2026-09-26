@@ -11,6 +11,9 @@ NVCOMP_SUCCESS = 0
 # From nvcomp/ans.h
 MAX_CHUNK_BYTES = 1 << 24
 DECOMPRESS_INPUT_ALIGNMENT = 8
+# Explicit max_sub_chunk_count must be a power of 2 in this range (0 means auto).
+MIN_SUB_CHUNKS = 4
+MAX_SUB_CHUNKS = 64
 
 
 class _CompressOpts(ctypes.Structure):
@@ -31,8 +34,13 @@ class _DecompressOpts(ctypes.Structure):
     ]
 
 
-_COMPRESS_OPTS = _CompressOpts(0, NVCOMP_TYPE_CHAR, 0)
+# 0 = autodetect the sub-chunk count from the bitstream, so any blob decodes.
 _DECOMPRESS_OPTS = _DecompressOpts(0, NVCOMP_TYPE_CHAR, 0)
+
+
+def _compress_opts(sub_chunks: int) -> _CompressOpts:
+    return _CompressOpts(0, NVCOMP_TYPE_CHAR, sub_chunks)
+
 
 # Not `import nvidia.libnvcomp`: importing nvidia.nvcomp first deletes that attribute from the namespace package.
 _lib = importlib.import_module("nvidia.libnvcomp").load_library()
@@ -105,9 +113,12 @@ def _check(status, what):
         raise RuntimeError(f"nvCOMP {what} failed with status {status}")
 
 
-def max_compressed_chunk_bytes(chunk_bytes: int) -> int:
+def max_compressed_chunk_bytes(chunk_bytes: int, sub_chunks: int) -> int:
     out = _size_t()
-    _check(_max_output(chunk_bytes, _COMPRESS_OPTS, ctypes.byref(out)), "GetMaxOutputChunkSize")
+    _check(
+        _max_output(chunk_bytes, _compress_opts(sub_chunks), ctypes.byref(out)),
+        "GetMaxOutputChunkSize",
+    )
     return out.value
 
 
@@ -119,17 +130,20 @@ def compress(
     out_ptrs: torch.Tensor,
     out_bytes: torch.Tensor,
     statuses: torch.Tensor,
+    sub_chunks: int,
     stream: int,
 ) -> None:
     """Asynchronously ANS-compress a batch of chunks on `stream`. All tensor arguments live on the GPU.
 
     in_ptrs/out_ptrs are int64 device addresses; in_bytes/out_bytes are int64 (size_t);
-    statuses is int32 and receives one nvcompStatus_t per chunk.
+    statuses is int32 and receives one nvcompStatus_t per chunk. Each chunk is coded as
+    `sub_chunks` independently decodable sub-chunks (0 lets nvCOMP choose).
     """
     n = in_ptrs.numel()
+    opts = _compress_opts(sub_chunks)
     temp_bytes = _size_t()
     _check(
-        _compress_temp(n, chunk_bytes, _COMPRESS_OPTS, ctypes.byref(temp_bytes), total_bytes),
+        _compress_temp(n, chunk_bytes, opts, ctypes.byref(temp_bytes), total_bytes),
         "CompressGetTempSize",
     )
     temp = torch.empty(max(temp_bytes.value, 1), dtype=torch.uint8, device=in_ptrs.device)
@@ -143,7 +157,7 @@ def compress(
             temp_bytes.value,
             out_ptrs.data_ptr(),
             out_bytes.data_ptr(),
-            _COMPRESS_OPTS,
+            opts,
             statuses.data_ptr(),
             stream,
         ),

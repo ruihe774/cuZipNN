@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from cuzipnn import _kernels, compress_tensor, decompress_tensor
+from cuzipnn import _codec, _kernels, compress_tensor, decompress_tensor
 
 _INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 FLOAT_DTYPES = [
@@ -200,6 +200,37 @@ def test_threshold_zero_stores_everything_raw():
     x = _weights(torch.bfloat16, 100_000)
     blob = _assert_roundtrip(x, chunk_bytes=CHUNK, threshold=0.0)
     assert blob.numel() >= 200_000
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("sub_chunk_bytes", [1, 1000, 8 * 1024, 32 * 1024, 1 << 30])
+def test_sub_chunk_bytes(dtype, sub_chunk_bytes):
+    # decompress_tensor needs no matching argument: nvCOMP reads the sub-chunk count from the bitstream.
+    _assert_roundtrip(_weights(dtype, 1_000_003), sub_chunk_bytes=sub_chunk_bytes)
+
+
+@pytest.mark.parametrize(
+    "chunk_bytes,sub_chunk_bytes,count",
+    [
+        (128 << 10, 8 << 10, 16),
+        (128 << 10, 7 << 10, 32),
+        (16 << 10, 8 << 10, 4),
+        (1 << 24, 1, 64),
+    ],
+)
+def test_sub_chunk_count(chunk_bytes, sub_chunk_bytes, count):
+    assert _codec._sub_chunks(chunk_bytes, sub_chunk_bytes) == count
+
+
+def test_larger_sub_chunks_compress_better():
+    x = _weights(torch.bfloat16, 2_000_000)
+    small, large = (compress_tensor(x, sub_chunk_bytes=s).numel() for s in (2 << 10, 32 << 10))
+    assert large < small
+
+
+def test_bad_sub_chunk_bytes():
+    with pytest.raises(ValueError):
+        compress_tensor(_weights(torch.bfloat16, 100), sub_chunk_bytes=0)
 
 
 def test_bad_blob():
