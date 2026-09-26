@@ -65,7 +65,7 @@ def _raw_bytes(
     """Uncompressed size of each (stream, chunk): chunk_bytes, except for each stream's last chunk."""
     raw = torch.full((k, nch), chunk_bytes * threshold, dtype=torch.int64, device=device)
     raw[:, -1] = (n - (nch - 1) * chunk_bytes) * threshold
-    return raw.flatten()
+    return raw.view(-1)
 
 
 def _sub_chunks(chunk_bytes: int, sub_chunk_bytes: int) -> int:
@@ -146,7 +146,11 @@ def compress_tensor(
         stream.wait_stream(current_stream)
 
     with torch.cuda.stream(stream):
-        x = x.to(device, non_blocking=True).flatten()
+        x = (
+            x.to(device, non_blocking=True, memory_format=torch.contiguous_format)
+            .contiguous()
+            .view(-1)
+        )
 
         # Bit reordering + byte grouping into K contiguous streams of nch chunks each.
         if k == 1:
@@ -199,7 +203,7 @@ def compress_tensor(
         stored = torch.where(use, comp_bytes, raw_bytes)
         padded = _align8(stored)
         ends = torch.cumsum(padded, 0)
-        comp_idx = use.nonzero().flatten()
+        comp_idx = use.nonzero().view(-1)
         n_comp = comp_idx.numel()
 
         sizes_off, idx_off, data_off = _layout(tensor.dim(), total, n_comp)
@@ -231,7 +235,7 @@ def compress_tensor(
         # The copies run through each chunk's 8-byte padding, which picks up whatever follows it
         # in the source; keep only the stored bytes of each chunk's last word.
         tail = stored % 8
-        part = tail.nonzero().flatten()
+        part = tail.nonzero().view(-1)
         words = blob[data_off:].view(torch.int64)
         words[ends[part] // 8 - 1] &= (1 << 8 * tail[part]) - 1
         return blob
