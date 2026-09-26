@@ -96,6 +96,8 @@ def compress_tensor(
         raise ValueError(
             f"chunk_bytes must be a multiple of 8 in (0, {_nvcomp.MAX_CHUNK_BYTES}]"
         )
+    if threshold <= 0 or threshold > 1:
+        raise ValueError("threshold must be in (0, 1]")
     if sub_chunk_bytes <= 0:
         raise ValueError("sub_chunk_bytes must be positive")
     sub_chunks = _sub_chunks(chunk_bytes, sub_chunk_bytes)
