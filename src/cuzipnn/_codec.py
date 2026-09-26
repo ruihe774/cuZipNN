@@ -371,9 +371,6 @@ def decompress_tensor(
             # The copy tables are built on the CPU, from a small copy of the blob's chunk table.
             is_raw = torch.ones(total, dtype=torch.bool, device="cpu")
             is_raw[comp_idx_cpu] = False
-            raw_cpu = _raw_bytes(k, nch, n, chunk_bytes, 1, "cpu")
-            if not torch.equal(stored_cpu[is_raw], raw_cpu[is_raw]):
-                raise ValueError("blob is corrupt: a raw chunk has the wrong size")
             src_cpu = x.data_ptr() + data_off + (torch.cumsum(padded_cpu, 0) - padded_cpu)
             raw_src = src_cpu[is_raw]
             raw_dst = torch.arange(
