@@ -131,7 +131,7 @@ def compress(
     out_bytes: torch.Tensor,
     statuses: torch.Tensor,
     sub_chunks: int,
-    stream: int,
+    stream: torch.cuda.Stream,
 ) -> None:
     """Asynchronously ANS-compress a batch of chunks on `stream`. All tensor arguments live on the GPU.
 
@@ -172,7 +172,7 @@ def decompress(
     chunk_bytes: int,
     total_bytes: int,
     out_ptrs: torch.Tensor,
-    stream: int,
+    stream: torch.cuda.Stream,
 ) -> None:
     """Asynchronously decompress a batch of ANS chunks on `stream`. All tensor arguments live on the GPU."""
     n = in_ptrs.numel()

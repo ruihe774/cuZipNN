@@ -190,7 +190,7 @@ def compress_tensor(
             comp_bytes,
             statuses,
             sub_chunks,
-            stream.cuda_stream,
+            stream,
         )
 
         raw_bytes = _raw_bytes(k, nch, n, chunk_bytes, 1, "cpu")
@@ -262,46 +262,63 @@ def decompress_tensor(
     """
     if blob.dtype != torch.uint8 or blob.dim() != 1:
         raise ValueError("blob must be a 1-D uint8 tensor")
-    prefix_len = min(blob.numel(), _FIXED.size + 8 * _MAX_NDIM)
-    prefix = bytes(blob[:prefix_len].cpu().tolist())
+
+    x = blob.detach()
+    prefix_len = min(x.numel(), _FIXED.size + 8 * _MAX_NDIM)
+    prefix_tensor = x[:prefix_len].to("cpu", memory_format=torch.contiguous_format).contiguous()
+    prefix = (ctypes.c_byte * prefix_len).from_address(prefix_tensor.data_ptr())
     dtype, shape, reorder, chunk_bytes, n_comp, n = _parse_header(prefix)
 
-    if device is None:
-        device = (
-            blob.device if blob.is_cuda else torch.device("cuda", torch.cuda.current_device())
-        )
+    device = (
+        torch.device(device)
+        if device is not None
+        else x.device
+        if x.is_cuda
+        else torch.device("cuda", torch.cuda.current_device())
+    )
+
+    out = torch.empty(shape, dtype=dtype, device=device)
+    if n == 0:
+        return out
+
+    current_stream = torch.cuda.current_stream(device)
+    if current_stream.cuda_stream != 0:
+        stream = current_stream
     else:
-        device = torch.device(device)
-    with torch.cuda.device(device):
-        out = torch.empty(shape, dtype=dtype, device=device)
-        if n == 0:
-            return out
-        blob = blob.to(device, non_blocking=True)
-        if blob.data_ptr() % 8:
-            blob = blob.clone()
+        stream = torch.cuda.Stream(device)
+        stream.wait_stream(current_stream)
+
+    with torch.cuda.stream(stream):
+        x = x.to(device, non_blocking=True, memory_format=torch.contiguous_format).contiguous()
+        if x.data_ptr() % 8:
+            x = x.clone()
 
         k = out.element_size()
         nch = triton.cdiv(n, chunk_bytes)
         total = k * nch
         sizes_off, idx_off, data_off = _layout(len(shape), total, n_comp)
-        if blob.numel() < data_off:
+        if x.numel() < data_off:
             raise ValueError("blob is truncated")
 
-        stored = blob[sizes_off:idx_off].view(torch.int32).to(torch.int64)
-        comp_idx = blob[idx_off : idx_off + 4 * n_comp].view(torch.int32).to(torch.int64)
+        stored = x[sizes_off:idx_off].view(torch.int32).to(torch.int64)
+        comp_idx = x[idx_off : idx_off + 4 * n_comp].view(torch.int32).to(torch.int64)
         padded = _align8(stored)
-        src = blob.data_ptr() + data_off + torch.cumsum(padded, 0) - padded
+        src = x.data_ptr() + data_off + (torch.cumsum(padded, 0) - padded)
         raw = _raw_bytes(k, nch, n, chunk_bytes, 1, device)
 
         # Single-stream dtypes decode straight into the output; others go through a planar buffer.
         planar = (
-            out.flatten().view(torch.uint8)
+            out.view(-1).view(torch.uint8)
             if k == 1
             else torch.empty(total * chunk_bytes, dtype=torch.uint8, device=device)
         )
-        slots = (
-            planar.data_ptr()
-            + torch.arange(total, dtype=torch.int64, device=device) * chunk_bytes
+        planar_base = planar.data_ptr()
+        slots = torch.arange(
+            planar_base,
+            planar_base + total * chunk_bytes,
+            chunk_bytes,
+            dtype=torch.int64,
+            device=device,
         )
 
         if n_comp:
@@ -312,7 +329,7 @@ def decompress_tensor(
                 chunk_bytes,
                 n_comp * chunk_bytes,
                 slots[comp_idx],
-                torch.cuda.current_stream(device).cuda_stream,
+                stream,
             )
 
         if k == 1:
@@ -323,5 +340,7 @@ def decompress_tensor(
         else:
             # Each stream's chunk comes from the planar buffer if ANS-decoded, else straight from the blob.
             tbl = src.index_copy(0, comp_idx, slots[comp_idx])
-            _kernels.merge(tbl, out.flatten(), chunk_bytes, reorder)
+            _kernels.merge(tbl, out.view(-1), chunk_bytes, reorder)
+
+        current_stream.wait_stream(stream)
         return out
