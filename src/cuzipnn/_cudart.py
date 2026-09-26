@@ -3,12 +3,11 @@
 import ctypes
 
 import torch
+from cuda.pathfinder import load_nvidia_dynamic_lib
 
-# torch has already loaded libcudart, so dlopen resolves the soname to that copy.
-_lib = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
+# Reuses the copy torch already loaded, else searches NVIDIA wheels, conda, and CUDA_HOME.
+_lib = ctypes.CDLL(load_nvidia_dynamic_lib("cudart").abs_path)
 
-# cudaMemcpyBatchAsync rejects the legacy NULL stream; this blocking stream is ordered with it.
-STREAM_PER_THREAD = 0x2
 _SRC_ACCESS_ORDER_STREAM = 0x1
 
 
@@ -42,7 +41,6 @@ def _bind(name, *argtypes):
 _memcpy_batch = _bind(
     "cudaMemcpyBatchAsync", _ptr, _ptr, _ptr, _size_t, _ptr, _ptr, _size_t, _ptr
 )
-_stream_sync = _bind("cudaStreamSynchronize", _ptr)
 
 
 def _check(err, what):
@@ -50,13 +48,8 @@ def _check(err, what):
         raise RuntimeError(f"{what} failed with cudaError {err}")
 
 
-def stream_for(device: torch.device) -> int:
-    """The current stream's handle, or the per-thread default stream in place of the NULL stream."""
-    return torch.cuda.current_stream(device).cuda_stream or STREAM_PER_THREAD
-
-
 def memcpy_batch(
-    dsts: torch.Tensor, srcs: torch.Tensor, sizes: torch.Tensor, stream: int
+    dsts: torch.Tensor, srcs: torch.Tensor, sizes: torch.Tensor, stream: torch.cuda.Stream
 ) -> None:
     """Asynchronously copy sizes[i] bytes from srcs[i] to dsts[i]; all three are CPU int64 tensors."""
     for t in (dsts, srcs, sizes):
@@ -74,7 +67,3 @@ def memcpy_batch(
         ),
         "cudaMemcpyBatchAsync",
     )
-
-
-def stream_synchronize(stream: int) -> None:
-    _check(_stream_sync(stream), "cudaStreamSynchronize")
