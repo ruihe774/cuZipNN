@@ -47,6 +47,8 @@ def _split_kernel(
     u = tl.load(x_ptr + offs, mask=mask, other=0).to(WT)
     if REORDER:
         u = _reorder(u, 8 * K)
+    # stride is an i32 argument when it fits, but (K - 1) * stride may not.
+    stride = stride.to(tl.int64)
     for b in tl.static_range(K):  # pyright: ignore[reportGeneralTypeIssues]
         tl.store(planar_ptr + b * stride + offs, (u >> (8 * b)).to(tl.uint8), mask=mask)
 

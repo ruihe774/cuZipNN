@@ -323,3 +323,36 @@ def test_split_matches_zipnn(dtype, reorder):
         c = ((v << 1) & 0xFF00) | ((v >> 8) & 0x80) | (v & 0x7F)
         assert torch.equal(ref[1], (c >> 8).to(torch.uint8))
         assert torch.equal(ref[0], (c & 0xFF).to(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "dtype,stride",
+    [
+        (torch.float32, 800_000_000),
+        (torch.float32, 800_000_008),
+        (torch.float64, 320_000_000),
+        (torch.float64, 320_000_008),
+    ],
+)
+def test_split_large_stride(dtype, stride):
+    # (K - 1) * stride >= 2**31 while stride itself fits in int32: stream offsets must not wrap.
+    # Strides that are not multiples of 16 skip Triton's divisibility specialization.
+    x = torch.randn(4099, device="cuda").to(dtype)
+    n, k = x.numel(), x.element_size()
+    planar = torch.zeros(k * stride, dtype=torch.uint8, device="cuda")
+    _kernels.split(x, planar, stride, False)
+    ref = _zipnn_reference_streams(x.cpu().view(_INT_VIEW[k]), False)
+    for b in range(k):
+        assert torch.equal(planar[b * stride : b * stride + n].cpu(), ref[b])
+
+
+def test_pinned_blob_reusable_after_return():
+    # The caller may overwrite a pinned blob as soon as decompress_tensor returns.
+    x = _weights(torch.bfloat16, 1_000_003)
+    blob = compress_tensor(x, chunk_bytes=CHUNK, pin_memory=True)
+    # Warm up first: loading the Triton module on the first launch synchronizes the device.
+    decompress_tensor(blob)
+    torch.cuda._sleep(1 << 30)  # keep the GPU busy so the upload is still queued on return
+    y = decompress_tensor(blob)
+    blob.zero_()
+    assert torch.equal(_bits(y), _bits(x))

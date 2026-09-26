@@ -328,6 +328,10 @@ def decompress_tensor(
         ).contiguous()
         if x.data_ptr() % 8:
             x = x.clone()
+        # A pinned blob is uploaded asynchronously, but the caller may reuse it once we return.
+        uploaded = torch.cuda.Event() if blob.is_pinned() else None
+        if uploaded is not None:
+            uploaded.record(stream)
 
         stored = x[sizes_off:idx_off].view(torch.int32).to(torch.int64)
         comp_idx = x[idx_off : idx_off + 4 * n_comp].view(torch.int32).to(torch.int64)
@@ -397,4 +401,6 @@ def decompress_tensor(
             _kernels.merge(tbl, out.view(-1), chunk_bytes, reorder)
 
         current_stream.wait_stream(stream)
+        if uploaded is not None:
+            uploaded.synchronize()
         return out.to(out_device)
