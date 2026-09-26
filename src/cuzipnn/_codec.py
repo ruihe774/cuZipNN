@@ -150,13 +150,9 @@ def compress_tensor(
 
         # Bit reordering + byte grouping into K contiguous streams of nch chunks each.
         if k == 1:
-            if x.data_ptr() % 8 == 0:
-                planar = x.view(torch.uint8)
-            else:
-                planar = torch.empty(triton.cdiv(n, 8), dtype=torch.uint64, device=device).view(
-                    torch.uint8
-                )[:n]
-                planar.copy_(x.view(torch.uint8), non_blocking=True)
+            planar = x.view(torch.uint8)
+            if planar.data_ptr() % 8:
+                planar = planar.clone()
         else:
             planar = torch.empty(total * chunk_bytes, dtype=torch.uint8, device=device)
             _kernels.split(x, planar, nch * chunk_bytes, reorder)
