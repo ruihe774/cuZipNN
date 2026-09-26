@@ -178,6 +178,7 @@ def compress_tensor(
             out_ptrs,
             comp_bytes,
             statuses,
+            stream.cuda_stream,
         )
 
         raw_bytes = _raw_bytes(k, nch, n, chunk_bytes, 1, "cpu")
@@ -299,6 +300,7 @@ def decompress_tensor(
                 chunk_bytes,
                 n_comp * chunk_bytes,
                 slots[comp_idx],
+                torch.cuda.current_stream(device).cuda_stream,
             )
 
         if k == 1:

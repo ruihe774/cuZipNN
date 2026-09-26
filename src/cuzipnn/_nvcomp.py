@@ -111,10 +111,6 @@ def max_compressed_chunk_bytes(chunk_bytes: int) -> int:
     return out.value
 
 
-def _stream(device: torch.device) -> int:
-    return torch.cuda.current_stream(device).cuda_stream
-
-
 def compress(
     in_ptrs: torch.Tensor,
     in_bytes: torch.Tensor,
@@ -123,8 +119,9 @@ def compress(
     out_ptrs: torch.Tensor,
     out_bytes: torch.Tensor,
     statuses: torch.Tensor,
+    stream: int,
 ) -> None:
-    """Asynchronously ANS-compress a batch of chunks. All tensor arguments live on the GPU.
+    """Asynchronously ANS-compress a batch of chunks on `stream`. All tensor arguments live on the GPU.
 
     in_ptrs/out_ptrs are int64 device addresses; in_bytes/out_bytes are int64 (size_t);
     statuses is int32 and receives one nvcompStatus_t per chunk.
@@ -148,7 +145,7 @@ def compress(
             out_bytes.data_ptr(),
             _COMPRESS_OPTS,
             statuses.data_ptr(),
-            _stream(in_ptrs.device),
+            stream,
         ),
         "CompressAsync",
     )
@@ -161,8 +158,9 @@ def decompress(
     chunk_bytes: int,
     total_bytes: int,
     out_ptrs: torch.Tensor,
+    stream: int,
 ) -> None:
-    """Asynchronously decompress a batch of ANS chunks. All tensor arguments live on the GPU."""
+    """Asynchronously decompress a batch of ANS chunks on `stream`. All tensor arguments live on the GPU."""
     n = in_ptrs.numel()
     device = in_ptrs.device
     temp_bytes = _size_t()
@@ -187,7 +185,7 @@ def decompress(
             out_ptrs.data_ptr(),
             _DECOMPRESS_OPTS,
             statuses.data_ptr(),
-            _stream(device),
+            stream,
         ),
         "DecompressAsync",
     )
