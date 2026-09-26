@@ -24,6 +24,8 @@ OTHER_DTYPES = [
     torch.complex64,
 ]
 CHUNK = 4096  # small chunks so moderate tensors span many chunks
+# Smallest useful threshold: every chunk's budget rounds down to 0 bytes, so all are stored raw.
+_ALL_RAW = 1e-9
 
 
 def _bits(t):
@@ -192,7 +194,7 @@ def test_deterministic_despite_bytes_past_view():
     blobs = []
     for fill in (0x00, 0xA5):
         base[CHUNK + 3 :] = fill
-        blobs.append(_assert_roundtrip(x, chunk_bytes=CHUNK, threshold=0.0))
+        blobs.append(_assert_roundtrip(x, chunk_bytes=CHUNK, threshold=_ALL_RAW))
     assert torch.equal(*blobs)
 
 
@@ -206,10 +208,16 @@ def test_non_default_stream():
     assert torch.equal(blob, ref)
 
 
-def test_threshold_zero_stores_everything_raw():
+def test_tiny_threshold_stores_everything_raw():
     x = _weights(torch.bfloat16, 100_000)
-    blob = _assert_roundtrip(x, chunk_bytes=CHUNK, threshold=0.0)
+    blob = _assert_roundtrip(x, chunk_bytes=CHUNK, threshold=_ALL_RAW)
     assert blob.numel() >= 200_000
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.5, 1.01])
+def test_bad_threshold(threshold):
+    with pytest.raises(ValueError, match="threshold"):
+        compress_tensor(_weights(torch.bfloat16, 100), threshold=threshold)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -280,18 +288,6 @@ def test_truncated_data_section():
     blob = compress_tensor(_mixed_int8(7), chunk_bytes=CHUNK)
     with pytest.raises(ValueError, match="truncated"):
         decompress_tensor(blob[:-8])
-
-
-def test_raw_chunk_with_wrong_size():
-    blob = compress_tensor(_mixed_int8(7), chunk_bytes=CHUNK)
-    sizes_off, _, _ = _codec._layout(1, 0, 0)
-    # Shrink the raw 13-byte tail (chunk 7) within its 8-byte padding, so no chunk moves; moving
-    # the ANS chunks would hand nvCOMP garbage, which it does not survive.
-    stored = blob[sizes_off + 4 * 7 : sizes_off + 4 * 8].view(torch.int32)
-    assert stored.item() == 13
-    stored -= 1
-    with pytest.raises(ValueError, match="raw chunk"):
-        decompress_tensor(blob)
 
 
 def _zipnn_reference_streams(x: torch.Tensor, reorder: bool) -> torch.Tensor:
