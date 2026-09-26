@@ -42,9 +42,7 @@ def _split_kernel(
     if REORDER:
         u = _reorder(u, 8 * K)
     for b in tl.static_range(K):
-        tl.store(
-            planar_ptr + b * stride + offs, ((u >> (8 * b)) & 0xFF).to(tl.uint8), mask=mask
-        )
+        tl.store(planar_ptr + b * stride + offs, (u >> (8 * b)).to(tl.uint8), mask=mask)
 
 
 @triton.jit
