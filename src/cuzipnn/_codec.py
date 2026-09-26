@@ -14,6 +14,7 @@ K is the element size in bytes (one stream per byte), and nch = ceil(numel / chu
 Chunk j of every stream covers elements [j * chunk_bytes, (j + 1) * chunk_bytes).
 """
 
+import ctypes
 import struct
 
 import torch
@@ -96,7 +97,12 @@ def compress_tensor(
         total = k * nch
 
         def header(n_comp):
-            fixed = _FIXED.pack(
+            shape_spec = struct.Struct(f"<{tensor.dim()}q")
+            r = torch.empty(_FIXED.size + shape_spec.size, dtype=torch.uint8, device="cpu")
+            b = (ctypes.c_byte * r.numel()).from_address(r.data_ptr())
+            _FIXED.pack_into(
+                b,
+                0,
                 _MAGIC,
                 _VERSION,
                 _CODES[x.dtype],
@@ -106,8 +112,8 @@ def compress_tensor(
                 n_comp,
                 n,
             )
-            shape = struct.pack(f"<{tensor.dim()}q", *tensor.shape)
-            return torch.frombuffer(bytearray(fixed + shape), dtype=torch.uint8)
+            shape_spec.pack_into(b, _FIXED.size, *tensor.shape)
+            return r
 
         if n == 0:
             return header(0).pin_memory()
