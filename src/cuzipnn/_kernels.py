@@ -89,7 +89,8 @@ def split(x: torch.Tensor, planar: torch.Tensor, stride: int, reorder: bool) -> 
         WT=_word_type(k),
         REORDER=reorder,
         BLOCK=_SPLIT_BLOCK,
-        num_warps=8,  # pyright: ignore[reportCallIssue]
+        # ~4 elements per thread for k=1 down to 1 for k>=4; ~2-4% faster than a fixed 8 for 4/8-byte dtypes on GB10.
+        num_warps=min(8 * k, 32),  # pyright: ignore[reportCallIssue]
     )
 
 
