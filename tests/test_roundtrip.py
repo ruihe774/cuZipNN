@@ -33,6 +33,8 @@ def _bits(t):
 
 
 def _assert_roundtrip(x, **kw):
+    # Exercise the compressed path unless a test asks otherwise; many inputs here are tiny.
+    kw.setdefault("min_compress_bytes", 0)
     blob = compress_tensor(x, **kw)
     assert not blob.is_cuda and blob.is_pinned() == kw.get("pin_memory", False)
     assert blob.dtype == torch.uint8 and blob.dim() == 1
@@ -270,7 +272,7 @@ def _mixed_int8(n_chunks):
 @pytest.mark.parametrize("layout", ["offset", "strided", "offset_in_misaligned_storage"])
 def test_unaligned_cpu_blob_view(layout):
     x = _mixed_int8(7)
-    blob = compress_tensor(x, chunk_bytes=CHUNK)
+    blob = compress_tensor(x, chunk_bytes=CHUNK, min_compress_bytes=0)
     if layout == "offset":
         view = torch.cat([torch.zeros(3, dtype=torch.uint8), blob])[3:]
     elif layout == "strided":
@@ -285,7 +287,7 @@ def test_unaligned_cpu_blob_view(layout):
 
 
 def test_truncated_data_section():
-    blob = compress_tensor(_mixed_int8(7), chunk_bytes=CHUNK)
+    blob = compress_tensor(_mixed_int8(7), chunk_bytes=CHUNK, min_compress_bytes=0)
     with pytest.raises(ValueError, match="truncated"):
         decompress_tensor(blob[:-8])
 
@@ -352,3 +354,64 @@ def test_pinned_blob_reusable_after_return():
     y = decompress_tensor(blob)
     blob.zero_()
     assert torch.equal(_bits(y), _bits(x))
+
+
+def _is_stored(blob):
+    return bool(blob[7].item() & _codec._FLAG_STORED)
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES + OTHER_DTYPES)
+@pytest.mark.parametrize("shape", [(), (0,), (3, 0, 5), (1,), (7,), (17, 33, 5)])
+def test_stored_roundtrip(dtype, shape):
+    x = torch.randn(shape, device="cuda").to(dtype)
+    nbytes = x.numel() * x.element_size()
+    blob = _assert_roundtrip(x, min_compress_bytes=nbytes + 1)
+    assert _is_stored(blob)
+    assert blob.numel() == _codec._FIXED.size + 8 * len(shape) + nbytes
+    y = decompress_tensor(blob, device="cpu")
+    assert y.device.type == "cpu" and torch.equal(_bits(y), _bits(x.cpu()))
+
+
+def test_stored_boundary():
+    x = _weights(torch.bfloat16, 1000)
+    assert _is_stored(compress_tensor(x, min_compress_bytes=2001))
+    assert not _is_stored(_assert_roundtrip(x, min_compress_bytes=2000))
+
+
+def test_default_min_compress_bytes():
+    small = _weights(torch.bfloat16, _codec.DEFAULT_MIN_COMPRESS_BYTES // 2 - 1)
+    large = _weights(torch.bfloat16, _codec.DEFAULT_MIN_COMPRESS_BYTES // 2)
+    assert _is_stored(compress_tensor(small))
+    assert not _is_stored(compress_tensor(large))
+    for x in (small, large):
+        assert torch.equal(_bits(decompress_tensor(compress_tensor(x))), _bits(x))
+
+
+def test_stored_non_contiguous_and_cpu_input():
+    x = _weights(torch.float32, 30 * 40).reshape(30, 40)
+    for v in (x.t(), x[::3, 1::2], x.cpu().t()):
+        blob = compress_tensor(v, pin_memory=True)
+        assert _is_stored(blob) and blob.is_pinned()
+        assert torch.equal(_bits(decompress_tensor(blob)), _bits(v.cuda()))
+        assert torch.equal(_bits(decompress_tensor(blob.cuda())), _bits(v.cuda()))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_stored_unaligned_blob_view(device):
+    x = _weights(torch.float64, 101)
+    blob = compress_tensor(x)
+    padded = torch.empty(blob.numel() + 3, dtype=torch.uint8, device=device)
+    padded[3:] = blob
+    assert torch.equal(_bits(decompress_tensor(padded[3:])), _bits(x))
+
+
+def test_stored_truncated():
+    blob = compress_tensor(_weights(torch.bfloat16, 100))
+    assert _is_stored(blob)
+    with pytest.raises(ValueError, match="truncated"):
+        decompress_tensor(blob[:-1])
+
+
+def test_bad_min_compress_bytes():
+    with pytest.raises(ValueError, match="min_compress_bytes"):
+        compress_tensor(_weights(torch.bfloat16, 100), min_compress_bytes=-1)

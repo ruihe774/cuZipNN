@@ -6,6 +6,12 @@ Blob layout (little-endian, every section 8-byte aligned):
     8   u32 chunk_bytes | u32 n_comp
     16  u64 numel
     24  i64 shape[ndim]
+
+flags: bit 0 = exponent bit reordering, bit 1 = stored uncompressed.
+
+A stored blob (tensors smaller than min_compress_bytes) has chunk_bytes = n_comp = 0, and the
+header is followed directly by the tensor's bytes in row-major order. Otherwise it continues:
+
     ..  i32 stored_bytes[K * nch]  bytes stored for each (stream, chunk), ANS-compressed or raw
     ..  i32 comp_idx[n_comp]       indices of the ANS-compressed chunks
     ..  data                       chunks in (stream, chunk) order, each padded to 8 bytes
@@ -24,14 +30,16 @@ import triton
 from . import _cudart, _kernels, _nvcomp
 
 _MAGIC = b"ZNNG"
-_VERSION = 1
+_VERSION = 2
 _FIXED = struct.Struct("<4sBBBBIIQ")
 _FLAG_REORDER = 1
+_FLAG_STORED = 2
 _MAX_NDIM = 64
 
 DEFAULT_CHUNK_BYTES = 128 * 1024
 DEFAULT_SUB_CHUNK_BYTES = 8 * 1024
 DEFAULT_THRESHOLD = 0.95
+DEFAULT_MIN_COMPRESS_BYTES = 64 * 1024
 
 _DTYPES = {
     1: torch.bool,
@@ -88,6 +96,7 @@ def compress_tensor(
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     sub_chunk_bytes: int = DEFAULT_SUB_CHUNK_BYTES,
     threshold: float = DEFAULT_THRESHOLD,
+    min_compress_bytes: int = DEFAULT_MIN_COMPRESS_BYTES,
     pin_memory: bool = False,
 ) -> torch.Tensor:
     """Compress a tensor losslessly on the GPU; returns a 1-D uint8 tensor in CPU memory."""
@@ -101,6 +110,8 @@ def compress_tensor(
         raise ValueError("threshold must be in (0, 1]")
     if sub_chunk_bytes <= 0:
         raise ValueError("sub_chunk_bytes must be positive")
+    if min_compress_bytes < 0:
+        raise ValueError("min_compress_bytes must be non-negative")
     sub_chunks = _sub_chunks(chunk_bytes, sub_chunk_bytes)
     if tensor.dim() > _MAX_NDIM:
         raise ValueError(f"at most {_MAX_NDIM} dimensions are supported")
@@ -111,7 +122,7 @@ def compress_tensor(
     nch = triton.cdiv(n, chunk_bytes)
     total = k * nch
 
-    def header(n_comp: int, size: int | None = None) -> torch.Tensor:
+    def header(n_comp: int, size: int | None = None, stored: bool = False) -> torch.Tensor:
         shape_spec = struct.Struct(f"<{tensor.dim()}q")
         header_size = _FIXED.size + shape_spec.size
         assert header_size == 24 + 8 * tensor.dim()  # sanity check
@@ -129,13 +140,19 @@ def compress_tensor(
             _VERSION,
             _CODES[x.dtype],
             tensor.dim(),
-            _FLAG_REORDER if reorder else 0,
-            chunk_bytes,
+            _FLAG_STORED if stored else _FLAG_REORDER if reorder else 0,
+            0 if stored else chunk_bytes,
             n_comp,
             n,
         )
         shape_spec.pack_into(b, _FIXED.size, *tensor.shape)
         return r
+
+    if n * k < min_compress_bytes:
+        header_size = _FIXED.size + 8 * tensor.dim()
+        blob = header(0, size=header_size + n * k, stored=True)
+        blob[header_size:].view(x.dtype).view(x.shape).copy_(x)
+        return blob
 
     if n == 0:
         return header(0)
@@ -246,7 +263,7 @@ def compress_tensor(
 
 def _parse_header(
     prefix: Buffer,
-) -> tuple[torch.dtype, tuple[int, ...], bool, int, int, int]:
+) -> tuple[torch.dtype, tuple[int, ...], int, int, int, int]:
     prefix = memoryview(prefix)
     if len(prefix) < _FIXED.size:
         raise ValueError("blob is too short")
@@ -256,7 +273,7 @@ def _parse_header(
     if len(prefix) < _FIXED.size + 8 * ndim:
         raise ValueError("blob is too short")
     shape = struct.unpack_from(f"<{ndim}q", prefix, _FIXED.size)
-    return _DTYPES[code], shape, bool(flags & _FLAG_REORDER), chunk_bytes, n_comp, n
+    return _DTYPES[code], shape, flags, chunk_bytes, n_comp, n
 
 
 def decompress_tensor(
@@ -278,7 +295,8 @@ def decompress_tensor(
         blob[:prefix_len].to("cpu", memory_format=torch.contiguous_format).contiguous()
     )
     prefix = (ctypes.c_byte * prefix_len).from_address(prefix_tensor.data_ptr())
-    dtype, shape, reorder, chunk_bytes, n_comp, n = _parse_header(prefix)
+    dtype, shape, flags, chunk_bytes, n_comp, n = _parse_header(prefix)
+    reorder = bool(flags & _FLAG_REORDER)
 
     device = (
         torch.device(device)
@@ -287,6 +305,17 @@ def decompress_tensor(
         if blob.is_cuda
         else torch.device("cuda", torch.cuda.current_device())
     )
+
+    if flags & _FLAG_STORED:
+        # Stored uncompressed: copy the bytes after the header straight to the target device.
+        header_size = _FIXED.size + 8 * len(shape)
+        out = torch.empty(shape, dtype=dtype, device=device)
+        nbytes = out.numel() * out.element_size()
+        if blob.numel() < header_size + nbytes:
+            raise ValueError("blob is truncated")
+        out.view(-1).view(torch.uint8).copy_(blob[header_size : header_size + nbytes])
+        return out
+
     # Decode on the GPU regardless; a non-CUDA target gets a copy at the end.
     out_device = device
     if device.type != "cuda":
