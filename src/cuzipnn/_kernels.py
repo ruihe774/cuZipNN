@@ -4,7 +4,13 @@ import torch
 import triton
 import triton.language as tl
 
+_SPLIT_BLOCK = 1024
+_MERGE_BLOCK = 4096
 _UNSIGNED = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32, 8: torch.uint64}
+
+
+def _word_type(k: int):
+    return tl.uint64 if k == 8 else tl.uint32
 
 
 @triton.jit
@@ -69,14 +75,6 @@ def _merge_kernel(
     if REORDER:
         u = _revert(u, 8 * K)
     tl.store(out_ptr + e, u.to(out_ptr.dtype.element_ty), mask=mask)
-
-
-_SPLIT_BLOCK = 1024
-_MERGE_BLOCK = 4096
-
-
-def _word_type(k: int):
-    return tl.uint64 if k == 8 else tl.uint32
 
 
 def split(x: torch.Tensor, planar: torch.Tensor, stride: int, reorder: bool) -> None:
