@@ -6,8 +6,23 @@ import torch
 from cuzipnn import _kernels, compress_tensor, decompress_tensor
 
 _INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
-FLOAT_DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.float64, torch.float8_e4m3fn, torch.float8_e5m2]
-OTHER_DTYPES = [torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.complex64]
+FLOAT_DTYPES = [
+    torch.bfloat16,
+    torch.float16,
+    torch.float32,
+    torch.float64,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+]
+OTHER_DTYPES = [
+    torch.bool,
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.complex64,
+]
 CHUNK = 4096  # small chunks so moderate tensors span many chunks
 
 
@@ -54,14 +69,27 @@ def test_default_chunk_large(dtype):
 
 @pytest.mark.parametrize("shape", [(), (0,), (3, 0, 5), (1,), (17, 33, 5), (2, 3, 4, 5, 6)])
 def test_shapes(shape):
-    _assert_roundtrip(_weights(torch.bfloat16, math.prod(shape)).reshape(shape), chunk_bytes=CHUNK)
+    _assert_roundtrip(
+        _weights(torch.bfloat16, math.prod(shape)).reshape(shape), chunk_bytes=CHUNK
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_special_values(dtype):
     info = torch.finfo(dtype)
     specials = torch.tensor(
-        [0.0, -0.0, float("inf"), float("-inf"), float("nan"), info.max, -info.max, info.tiny, info.tiny / 4, -info.tiny / 8],
+        [
+            0.0,
+            -0.0,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+            info.max,
+            -info.max,
+            info.tiny,
+            info.tiny / 4,
+            -info.tiny / 8,
+        ],
         dtype=dtype,
     )
     _assert_roundtrip(specials.repeat(1000).cuda(), chunk_bytes=CHUNK)
@@ -70,8 +98,14 @@ def test_special_values(dtype):
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
 def test_all_bit_patterns(dtype):
     # Every bit pattern (incl. NaN payloads) survives, via random bits reinterpreted as floats too.
-    bits = torch.randint(torch.iinfo(dtype).min, torch.iinfo(dtype).max, (300_001,), dtype=dtype, device="cuda")
-    float_view = {torch.int8: torch.float8_e5m2, torch.int16: torch.bfloat16, torch.int32: torch.float32}[dtype]
+    bits = torch.randint(
+        torch.iinfo(dtype).min, torch.iinfo(dtype).max, (300_001,), dtype=dtype, device="cuda"
+    )
+    float_view = {
+        torch.int8: torch.float8_e5m2,
+        torch.int16: torch.bfloat16,
+        torch.int32: torch.float32,
+    }[dtype]
     blob = _assert_roundtrip(bits.view(float_view), chunk_bytes=CHUNK)
     # Random bytes are incompressible: every chunk must fall back to raw, so the overhead stays tiny.
     assert blob.numel() < bits.numel() * bits.element_size() * 1.01
@@ -111,7 +145,9 @@ def test_unaligned_blob_view():
 
 def test_deterministic():
     x = _weights(torch.bfloat16, 1_000_003)
-    assert torch.equal(compress_tensor(x, chunk_bytes=CHUNK), compress_tensor(x, chunk_bytes=CHUNK))
+    assert torch.equal(
+        compress_tensor(x, chunk_bytes=CHUNK), compress_tensor(x, chunk_bytes=CHUNK)
+    )
 
 
 def test_deterministic_despite_stale_device_memory():
@@ -160,7 +196,9 @@ def _zipnn_reference_streams(x: torch.Tensor, reorder: bool) -> torch.Tensor:
     return torch.stack([((u >> (8 * b)) & 0xFF).to(torch.uint8) for b in range(k)])
 
 
-@pytest.mark.parametrize("dtype,reorder", [(torch.bfloat16, True), (torch.float32, True), (torch.float16, False)])
+@pytest.mark.parametrize(
+    "dtype,reorder", [(torch.bfloat16, True), (torch.float32, True), (torch.float16, False)]
+)
 def test_split_matches_zipnn(dtype, reorder):
     x = torch.randn(10_001, device="cuda").to(dtype)
     n, k = x.numel(), x.element_size()
@@ -171,6 +209,6 @@ def test_split_matches_zipnn(dtype, reorder):
     # And against ZipNN's exact C bit formulas for the 16-bit case.
     if dtype == torch.bfloat16:
         v = x.cpu().view(torch.int16).to(torch.int64) & 0xFFFF
-        c = (((v << 1) & 0xFF00) | ((v >> 8) & 0x80) | (v & 0x7F))
+        c = ((v << 1) & 0xFF00) | ((v >> 8) & 0x80) | (v & 0x7F)
         assert torch.equal(ref[1], (c >> 8).to(torch.uint8))
         assert torch.equal(ref[0], (c & 0xFF).to(torch.uint8))
