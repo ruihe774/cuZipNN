@@ -55,12 +55,12 @@ _CODES = {dtype: code for code, dtype in _DTYPES.items()}
 _REORDER = {torch.bfloat16, torch.float32}
 
 
-def _align8(x):
+def _align8[T: (int, torch.Tensor)](x: T) -> T:
     return (x + 7) & ~7
 
 
 def _raw_bytes(
-    k: int, nch: int, n: int, chunk_bytes: int, threshold: float, device
+    k: int, nch: int, n: int, chunk_bytes: int, threshold: float, device: torch.device | str
 ) -> torch.Tensor:
     """Uncompressed size of each (stream, chunk): chunk_bytes, except for each stream's last chunk."""
     raw = torch.full((k, nch), chunk_bytes * threshold, dtype=torch.int64, device=device)
@@ -74,7 +74,7 @@ def _sub_chunks(chunk_bytes: int, sub_chunk_bytes: int) -> int:
     return min(max(count, _nvcomp.MIN_SUB_CHUNKS), _nvcomp.MAX_SUB_CHUNKS)
 
 
-def _layout(ndim: int, total: int, n_comp: int):
+def _layout(ndim: int, total: int, n_comp: int) -> tuple[int, int, int]:
     sizes_off = 24 + 8 * ndim
     idx_off = sizes_off + 4 * total
     data_off = _align8(idx_off + 4 * n_comp)
@@ -108,7 +108,7 @@ def compress_tensor(
     nch = triton.cdiv(n, chunk_bytes)
     total = k * nch
 
-    def header(n_comp: int, size: int | None = None):
+    def header(n_comp: int, size: int | None = None) -> torch.Tensor:
         shape_spec = struct.Struct(f"<{tensor.dim()}q")
         header_size = _FIXED.size + shape_spec.size
         assert header_size == 24 + 8 * tensor.dim()  # sanity check
@@ -207,7 +207,7 @@ def compress_tensor(
         n_comp = comp_idx.numel()
 
         sizes_off, idx_off, data_off = _layout(tensor.dim(), total, n_comp)
-        blob = header(n_comp, size=data_off + ends[-1].item())
+        blob = header(n_comp, size=data_off + int(ends[-1]))
         blob[sizes_off:idx_off].view(torch.int32).copy_(stored)
         blob[idx_off : idx_off + 4 * n_comp].view(torch.int32).copy_(comp_idx)
         blob[idx_off + 4 * n_comp : data_off].zero_()
@@ -241,7 +241,9 @@ def compress_tensor(
         return blob
 
 
-def _parse_header(prefix: bytes):
+def _parse_header(
+    prefix: bytes,
+) -> tuple[torch.dtype, tuple[int, ...], bool, int, int, int]:
     if len(prefix) < _FIXED.size:
         raise ValueError("blob is too short")
     magic, version, code, ndim, flags, chunk_bytes, n_comp, n = _FIXED.unpack_from(prefix)
@@ -271,7 +273,7 @@ def decompress_tensor(
     prefix_tensor = (
         blob[:prefix_len].to("cpu", memory_format=torch.contiguous_format).contiguous()
     )
-    prefix = (ctypes.c_byte * prefix_len).from_address(prefix_tensor.data_ptr())
+    prefix = ctypes.string_at(prefix_tensor.data_ptr(), prefix_len)
     dtype, shape, reorder, chunk_bytes, n_comp, n = _parse_header(prefix)
 
     device = (
@@ -296,6 +298,8 @@ def decompress_tensor(
     sizes_off, idx_off, data_off = _layout(len(shape), total, n_comp)
     if blob.numel() < data_off:
         raise ValueError("blob is truncated")
+    # For k == 1: (stored bytes, padded bytes, comp_idx) of every chunk, on the CPU.
+    cpu_table: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     if k == 1:
         table = (
             blob[sizes_off : idx_off + 4 * n_comp]
@@ -309,6 +313,7 @@ def decompress_tensor(
         # nvCOMP reads the compressed chunks, so the data section must be complete before it runs.
         if blob.numel() < data_off + padded_cpu.sum().item():
             raise ValueError("blob is truncated")
+        cpu_table = stored_cpu, padded_cpu, table[4 * total :].view(torch.int32)
 
     current_stream = torch.cuda.current_stream(device)
     if current_stream.cuda_stream != 0:
@@ -356,11 +361,12 @@ def decompress_tensor(
                 stream,
             )
 
-        if k == 1:
+        if cpu_table is not None:
+            stored_cpu, padded_cpu, comp_idx_cpu = cpu_table
             # Copy the raw chunks into place; nvCOMP decodes the ANS chunks into their slots.
             # The copy tables are built on the CPU, from a small copy of the blob's chunk table.
             is_raw = torch.ones(total, dtype=torch.bool, device="cpu")
-            is_raw[table[4 * total :].view(torch.int32)] = False
+            is_raw[comp_idx_cpu] = False
             raw_cpu = _raw_bytes(k, nch, n, chunk_bytes, 1, "cpu")
             if not torch.equal(stored_cpu[is_raw], raw_cpu[is_raw]):
                 raise ValueError("blob is corrupt: a raw chunk has the wrong size")

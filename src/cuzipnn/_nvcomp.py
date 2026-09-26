@@ -2,6 +2,7 @@
 
 import ctypes
 import importlib
+from typing import Any
 
 import torch
 
@@ -52,7 +53,7 @@ _ptr = ctypes.c_void_p
 _size_p = ctypes.POINTER(ctypes.c_size_t)
 
 
-def _bind(name, *argtypes):
+def _bind(name: str, *argtypes: type) -> Any:
     fn = getattr(_lib, name)
     fn.argtypes = argtypes
     fn.restype = ctypes.c_int
@@ -108,7 +109,7 @@ _decompress = _bind(
 )
 
 
-def _check(status, what):
+def _check(status: int, what: str) -> None:
     if status != NVCOMP_SUCCESS:
         raise RuntimeError(f"nvCOMP {what} failed with status {status}")
 

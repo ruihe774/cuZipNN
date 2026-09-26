@@ -1,6 +1,7 @@
 """Minimal ctypes bindings for the CUDA runtime calls that PyTorch does not expose."""
 
 import ctypes
+from typing import Any
 
 import torch
 from cuda.pathfinder import load_nvidia_dynamic_lib
@@ -31,7 +32,7 @@ _size_t = ctypes.c_size_t
 _ptr = ctypes.c_void_p
 
 
-def _bind(name, *argtypes):
+def _bind(name: str, *argtypes: type) -> Any:
     fn = getattr(_lib, name)
     fn.argtypes = argtypes
     fn.restype = ctypes.c_int
@@ -43,7 +44,7 @@ _memcpy_batch = _bind(
 )
 
 
-def _check(err, what):
+def _check(err: int, what: str) -> None:
     if err:
         raise RuntimeError(f"{what} failed with cudaError {err}")
 

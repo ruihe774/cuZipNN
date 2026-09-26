@@ -9,7 +9,7 @@ _MERGE_BLOCK = 4096
 _UNSIGNED = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32, 8: torch.uint64}
 
 
-def _word_type(k: int):
+def _word_type(k: int) -> tl.dtype:
     return tl.uint64 if k == 8 else tl.uint32
 
 
@@ -18,7 +18,7 @@ def _reorder(u, W: tl.constexpr):
     # ZipNN bit reorder: `s eeeeeeee m...` -> `eeeeeeee s m...`, putting the whole exponent in the MSByte.
     exp = (u >> (W - 9)) & 0xFF
     sign = u >> (W - 1)
-    mant = u & ((1 << (W - 9)) - 1)
+    mant = u & ((1 << (W - 9)) - 1)  # pyright: ignore[reportOperatorIssue]
     return (exp << (W - 8)) | (sign << (W - 9)) | mant
 
 
@@ -26,7 +26,7 @@ def _reorder(u, W: tl.constexpr):
 def _revert(u, W: tl.constexpr):
     exp = u >> (W - 8)
     sign = (u >> (W - 9)) & 1
-    mant = u & ((1 << (W - 9)) - 1)
+    mant = u & ((1 << (W - 9)) - 1)  # pyright: ignore[reportOperatorIssue]
     return (sign << (W - 1)) | (exp << (W - 9)) | mant
 
 
@@ -47,7 +47,7 @@ def _split_kernel(
     u = tl.load(x_ptr + offs, mask=mask, other=0).to(WT)
     if REORDER:
         u = _reorder(u, 8 * K)
-    for b in tl.static_range(K):
+    for b in tl.static_range(K):  # pyright: ignore[reportGeneralTypeIssues]
         tl.store(planar_ptr + b * stride + offs, (u >> (8 * b)).to(tl.uint8), mask=mask)
 
 
@@ -69,7 +69,7 @@ def _merge_kernel(
     e = j.to(tl.int64) * C + offs
     mask = (offs < C) & (e < n)
     u = tl.zeros((BLOCK,), WT)
-    for b in tl.static_range(K):
+    for b in tl.static_range(K):  # pyright: ignore[reportGeneralTypeIssues]
         src = tl.load(src_tbl + b * nch + j).to(tl.pointer_type(tl.uint8))
         u |= tl.load(src + offs, mask=mask, other=0).to(WT) << (8 * b)
     if REORDER:
@@ -89,7 +89,7 @@ def split(x: torch.Tensor, planar: torch.Tensor, stride: int, reorder: bool) -> 
         WT=_word_type(k),
         REORDER=reorder,
         BLOCK=_SPLIT_BLOCK,
-        num_warps=8,
+        num_warps=8,  # pyright: ignore[reportCallIssue]
     )
 
 
@@ -108,5 +108,5 @@ def merge(src_tbl: torch.Tensor, out: torch.Tensor, chunk_bytes: int, reorder: b
         WT=_word_type(k),
         REORDER=reorder,
         BLOCK=_MERGE_BLOCK,
-        num_warps=8,
+        num_warps=8,  # pyright: ignore[reportCallIssue]
     )
