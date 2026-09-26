@@ -32,7 +32,7 @@ def _bits(t):
 
 def _assert_roundtrip(x, **kw):
     blob = compress_tensor(x, **kw)
-    assert not blob.is_cuda and blob.is_pinned()
+    assert not blob.is_cuda and blob.is_pinned() == kw.get("pin_memory", False)
     assert blob.dtype == torch.uint8 and blob.dim() == 1
     y = decompress_tensor(blob)
     assert y.is_cuda and y.dtype == x.dtype and y.shape == x.shape
@@ -59,6 +59,12 @@ def test_other_dtypes(dtype):
     else:
         x = torch.randint(-100, 100, (100_003,), device="cuda").to(dtype)
     _assert_roundtrip(x, chunk_bytes=CHUNK)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_pinned(dtype):
+    _assert_roundtrip(_weights(dtype, 10 * CHUNK + 13), chunk_bytes=CHUNK, pin_memory=True)
+    _assert_roundtrip(torch.empty(0, dtype=dtype), pin_memory=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

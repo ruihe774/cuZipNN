@@ -79,8 +79,9 @@ def compress_tensor(
     *,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     threshold: float = DEFAULT_THRESHOLD,
+    pin_memory: bool = False,
 ) -> torch.Tensor:
-    """Compress a tensor losslessly on the GPU; returns a 1-D uint8 tensor in pinned CPU memory."""
+    """Compress a tensor losslessly on the GPU; returns a 1-D uint8 tensor in CPU memory."""
     if tensor.dtype not in _CODES:
         raise TypeError(f"unsupported dtype {tensor.dtype}")
     if chunk_bytes % 8 or not 0 < chunk_bytes <= _nvcomp.MAX_CHUNK_BYTES:
@@ -104,7 +105,7 @@ def compress_tensor(
             header_size if size is None else size,
             dtype=torch.uint8,
             device="cpu",
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
         b = (ctypes.c_byte * r.numel()).from_address(r.data_ptr())
         _FIXED.pack_into(
