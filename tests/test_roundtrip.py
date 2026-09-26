@@ -141,6 +141,16 @@ def test_cpu_input_and_cpu_blob():
     assert y.is_cuda and torch.equal(_bits(x), _bits(y).cpu())
 
 
+@pytest.mark.parametrize("n", [0, 100_000])
+def test_decompress_to_cpu(n):
+    x = _weights(torch.bfloat16, n)
+    blob = compress_tensor(x, chunk_bytes=CHUNK)
+    for b in (blob, blob.cuda()):
+        y = decompress_tensor(b, device="cpu")
+        assert y.device.type == "cpu" and y.shape == x.shape
+        assert torch.equal(_bits(x.cpu()), _bits(y))
+
+
 def test_unaligned_blob_view():
     x = _weights(torch.float32, 100_000)
     blob = compress_tensor(x, chunk_bytes=CHUNK)

@@ -259,6 +259,7 @@ def decompress_tensor(
     """Decompress a blob produced by compress_tensor; the blob may be on the CPU or the GPU.
 
     The result is placed on `device` (default: the blob's device if it is on the GPU, else the current CUDA device).
+    Decoding always runs on the GPU; a non-CUDA `device` such as "cpu" receives a copy of the result.
     """
     if blob.dtype != torch.uint8 or blob.dim() != 1:
         raise ValueError("blob must be a 1-D uint8 tensor")
@@ -276,10 +277,14 @@ def decompress_tensor(
         if x.is_cuda
         else torch.device("cuda", torch.cuda.current_device())
     )
+    # Decode on the GPU regardless; a non-CUDA target gets a copy at the end.
+    out_device = device
+    if device.type != "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
 
-    out = torch.empty(shape, dtype=dtype, device=device)
     if n == 0:
-        return out
+        return torch.empty(shape, dtype=dtype, device=out_device)
+    out = torch.empty(shape, dtype=dtype, device=device)
 
     current_stream = torch.cuda.current_stream(device)
     if current_stream.cuda_stream != 0:
@@ -343,4 +348,4 @@ def decompress_tensor(
             _kernels.merge(tbl, out.view(-1), chunk_bytes, reorder)
 
         current_stream.wait_stream(stream)
-        return out
+        return out.to(out_device)
