@@ -19,7 +19,7 @@ import struct
 import torch
 import triton
 
-from . import _kernels, _nvcomp
+from . import _cudart, _kernels, _nvcomp
 
 _MAGIC = b"ZNNG"
 _VERSION = 1
@@ -77,7 +77,7 @@ def compress_tensor(
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     threshold: float = DEFAULT_THRESHOLD,
 ) -> torch.Tensor:
-    """Compress a tensor losslessly on the GPU; returns a 1-D uint8 CUDA tensor."""
+    """Compress a tensor losslessly on the GPU; returns a 1-D uint8 tensor in pinned CPU memory."""
     if tensor.dtype not in _CODES:
         raise TypeError(f"unsupported dtype {tensor.dtype}")
     if chunk_bytes % 8 or not 0 < chunk_bytes <= _nvcomp.MAX_CHUNK_BYTES:
@@ -94,21 +94,23 @@ def compress_tensor(
         k, n, reorder = x.element_size(), x.numel(), x.dtype in _REORDER
         nch = triton.cdiv(n, chunk_bytes)
         total = k * nch
-        header = _FIXED.pack(
-            _MAGIC,
-            _VERSION,
-            _CODES[x.dtype],
-            tensor.dim(),
-            _FLAG_REORDER if reorder else 0,
-            chunk_bytes,
-            0,
-            n,
-        ) + struct.pack(f"<{tensor.dim()}q", *tensor.shape)
+
+        def header(n_comp):
+            fixed = _FIXED.pack(
+                _MAGIC,
+                _VERSION,
+                _CODES[x.dtype],
+                tensor.dim(),
+                _FLAG_REORDER if reorder else 0,
+                chunk_bytes,
+                n_comp,
+                n,
+            )
+            shape = struct.pack(f"<{tensor.dim()}q", *tensor.shape)
+            return torch.frombuffer(bytearray(fixed + shape), dtype=torch.uint8)
 
         if n == 0:
-            return torch.frombuffer(bytearray(header), dtype=torch.uint8).to(
-                device, non_blocking=True
-            )
+            return header(0).pin_memory()
 
         # Bit reordering + byte grouping into K contiguous streams of nch chunks each.
         if k == 1 and x.data_ptr() % 8 == 0:
@@ -118,7 +120,6 @@ def compress_tensor(
             _kernels.split(x, planar, nch * chunk_bytes, reorder)
 
         # Entropy-code every (stream, chunk) in one nvCOMP batch.
-        raw = _raw_bytes(k, nch, n, chunk_bytes, device)
         in_start = planar.data_ptr()
         in_ptrs = torch.arange(
             in_start,
@@ -128,36 +129,57 @@ def compress_tensor(
             device=device,
         )
         slot = _align8(_nvcomp.max_compressed_chunk_bytes(chunk_bytes))
-        comp = torch.empty(total * slot, dtype=torch.uint8, device=device)
+        # Zeroed: nvCOMP's rANS leaves some bytes within comp_bytes unwritten, which would
+        # otherwise leak stale device memory into the blob and make it non-deterministic.
+        comp = torch.zeros(total * slot, dtype=torch.uint8, device=device)
         out_start = comp.data_ptr()
         out_ptrs = torch.arange(
             out_start, out_start + total * slot, slot, dtype=torch.int64, device=device
         )
-        comp_bytes = torch.empty(total, dtype=torch.int64, device=device)
-        statuses = torch.empty(total, dtype=torch.int32, device=device)
-        _nvcomp.compress(in_ptrs, raw, chunk_bytes, k * n, out_ptrs, comp_bytes, statuses)
+        # comp_bytes (int64) and statuses (int32) share one buffer, fetched with a single D2H copy.
+        results = torch.empty(3 * total, dtype=torch.int32, device=device)
+        _nvcomp.compress(
+            in_ptrs,
+            _raw_bytes(k, nch, n, chunk_bytes, device),
+            chunk_bytes,
+            k * n,
+            out_ptrs,
+            results[: 2 * total].view(torch.int64),
+            results[2 * total :],
+        )
+        results = results.to("cpu", non_blocking=True)  # into pinned memory
+        torch.cuda.current_stream(device).synchronize()
+        comp_bytes, statuses = results[: 2 * total].view(torch.int64), results[2 * total :]
 
         # Keep a chunk compressed only if it saves enough; otherwise store it raw (ZipNN's threshold rule).
+        raw = _raw_bytes(k, nch, n, chunk_bytes, "cpu")
         use = (statuses == _nvcomp.NVCOMP_SUCCESS) & (comp_bytes < raw * threshold)
         stored = torch.where(use, comp_bytes, raw)
         padded = _align8(stored)
-        starts = torch.cumsum(padded, 0) - padded
-        n_comp, data_bytes = torch.stack([use.sum(), starts[-1] + padded[-1]]).tolist()
-        comp_idx = torch.nonzero_static(use, size=n_comp).flatten()
+        ends = torch.cumsum(padded, 0)
+        comp_idx = use.nonzero().flatten()
+        n_comp = comp_idx.numel()
 
         sizes_off, idx_off, data_off = _layout(tensor.dim(), total, n_comp)
-        blob = torch.empty(data_off + data_bytes, dtype=torch.uint8, device=device)
-        header = header[:12] + struct.pack("<I", n_comp) + header[16:]
-        blob[:sizes_off].copy_(
-            torch.frombuffer(bytearray(header), dtype=torch.uint8), non_blocking=True
-        )
+        blob = torch.empty(data_off + ends[-1].item(), dtype=torch.uint8, pin_memory=True)
+        blob[:sizes_off] = header(n_comp)
         blob[sizes_off:idx_off].view(torch.int32).copy_(stored)
         blob[idx_off : idx_off + 4 * n_comp].view(torch.int32).copy_(comp_idx)
         blob[idx_off + 4 * n_comp : data_off].zero_()
+        # Zero each chunk's last 8-byte word up front; the copies overwrite all but its padding.
+        blob[data_off:].view(torch.int64)[ends // 8 - 1] = 0
 
-        src = torch.where(use, out_ptrs, in_ptrs)
-        dst = blob.data_ptr() + data_off + starts
-        _kernels.copy_chunks(src, dst, stored, chunk_bytes, pad=True)
+        idx = torch.arange(total, dtype=torch.int64)
+        src = torch.where(use, out_start + idx * slot, in_start + idx * chunk_bytes)
+        dst = blob.data_ptr() + data_off + ends - padded
+        # One copy per run of chunks that are back to back in both the source and the blob
+        # (consecutive raw chunks), which collapses incompressible streams into a few copies.
+        head = torch.ones(total, dtype=torch.bool)
+        head[1:] = (src[:-1] + stored[:-1] != src[1:]) | (dst[:-1] + stored[:-1] != dst[1:])
+        last = head.roll(-1)
+        stream = _cudart.stream_for(device)
+        _cudart.memcpy_batch(dst[head], src[head], dst[last] + stored[last] - dst[head], stream)
+        _cudart.stream_synchronize(stream)
         return blob
 
 

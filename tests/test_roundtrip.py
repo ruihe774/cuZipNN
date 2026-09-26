@@ -17,7 +17,8 @@ def _bits(t):
 
 def _assert_roundtrip(x, **kw):
     blob = compress_tensor(x, **kw)
-    assert blob.is_cuda and blob.dtype == torch.uint8 and blob.dim() == 1
+    assert not blob.is_cuda and blob.is_pinned()
+    assert blob.dtype == torch.uint8 and blob.dim() == 1
     y = decompress_tensor(blob)
     assert y.is_cuda and y.dtype == x.dtype and y.shape == x.shape
     assert torch.equal(_bits(x.cuda()), _bits(y))
@@ -111,6 +112,28 @@ def test_unaligned_blob_view():
 def test_deterministic():
     x = _weights(torch.bfloat16, 1_000_003)
     assert torch.equal(compress_tensor(x, chunk_bytes=CHUNK), compress_tensor(x, chunk_bytes=CHUNK))
+
+
+def test_deterministic_despite_stale_device_memory():
+    # nvCOMP's rANS leaves some bytes within comp_bytes unwritten; they must not pick up stale memory.
+    x = _weights(torch.bfloat16, 4_000_000)
+    blobs = []
+    for fill in (0x00, 0xA5):
+        torch.cuda.empty_cache()
+        # Freed straight back to the cache, so the next call's buffers start out dirty.
+        torch.full((256 << 20,), fill, dtype=torch.uint8, device="cuda")
+        blobs.append(compress_tensor(x, chunk_bytes=CHUNK))
+    assert torch.equal(*blobs)
+
+
+def test_non_default_stream():
+    x = _weights(torch.bfloat16, 1_000_003)
+    ref = compress_tensor(x, chunk_bytes=CHUNK)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        s.wait_stream(torch.cuda.default_stream())
+        blob = compress_tensor(x, chunk_bytes=CHUNK)
+    assert torch.equal(blob, ref)
 
 
 def test_threshold_zero_stores_everything_raw():
