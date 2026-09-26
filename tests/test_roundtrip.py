@@ -271,7 +271,7 @@ def test_unaligned_cpu_blob_view(layout):
         # The storage starts 3 bytes into the buffer, so the view's address is 4-byte aligned
         # but its storage offset (1) is not.
         buf = bytearray(blob.numel() + 4)
-        buf[4:] = blob.numpy().tobytes()
+        torch.frombuffer(buf, dtype=torch.uint8)[4:].copy_(blob)
         view = torch.frombuffer(memoryview(buf)[3:], dtype=torch.uint8)[1:]
     assert torch.equal(decompress_tensor(view), x)
 
