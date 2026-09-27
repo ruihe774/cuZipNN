@@ -40,6 +40,7 @@ DEFAULT_CHUNK_BYTES = 128 * 1024
 DEFAULT_SUB_CHUNK_BYTES = 8 * 1024
 DEFAULT_PASSTHROUGH_THRESHOLD = 0.95
 DEFAULT_MIN_COMPRESS_BYTES = 64 * 1024
+DEFAULT_CHECKSUM_CHUNK_BYTES = 16 * 1024
 
 _DTYPES = {
     1: torch.bool,
@@ -90,6 +91,49 @@ def _layout(ndim: int, total: int, n_comp: int) -> tuple[int, int, int]:
     return sizes_off, idx_off, data_off
 
 
+def _gpu(x: torch.Tensor) -> torch.device:
+    return x.device if x.is_cuda else torch.device("cuda", torch.cuda.current_device())
+
+
+def _crc32(
+    data: torch.Tensor, checksum_chunk_bytes: int, stream: torch.cuda.Stream
+) -> torch.Tensor:
+    """Enqueue the CRC-32 of each checksum_chunk_bytes-byte chunk of `data`, a contiguous uint8
+    CUDA tensor, on `stream`. The last chunk may be shorter. Returns uint32 on the GPU."""
+    nbytes = data.numel()
+    m = triton.cdiv(nbytes, checksum_chunk_bytes)
+    crc = torch.empty(m, dtype=torch.uint32, device=data.device)
+    if m:
+        # A short last chunk just gets its own size in the same batch: one launch, no padding.
+        sizes = torch.full((m,), checksum_chunk_bytes, dtype=torch.int64)
+        sizes[-1] = nbytes - (m - 1) * checksum_chunk_bytes
+        base = data.data_ptr()
+        ptrs = torch.arange(base, base + nbytes, checksum_chunk_bytes, dtype=torch.int64)
+        tbl = torch.stack([ptrs, sizes]).to(data.device, non_blocking=True)
+        _nvcomp.crc32(tbl[0], tbl[1], min(checksum_chunk_bytes, nbytes), crc, stream)
+    return crc
+
+
+def _fill_stored(
+    blob: torch.Tensor, offset: int, x: torch.Tensor, checksum_chunk_bytes: int | None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Copy x's bytes into blob[offset:], after blob's header. With checksum_chunk_bytes, the blob
+    is assembled and hashed on the GPU before it is copied back."""
+    if checksum_chunk_bytes is None:
+        blob[offset:].view(x.dtype).view(x.shape).copy_(x)
+        return blob, None
+    device = _gpu(x)
+    stream = torch.cuda.current_stream(device)
+    with torch.cuda.stream(stream):
+        buf = torch.empty(blob.numel(), dtype=torch.uint8, device=device)
+        buf[:offset].copy_(blob[:offset], non_blocking=True)
+        buf[offset:].view(x.dtype).view(x.shape).copy_(x, non_blocking=True)
+        crc = _crc32(buf, checksum_chunk_bytes, stream)
+        blob.copy_(buf, non_blocking=True)
+        stream.synchronize()
+        return blob, crc.cpu()
+
+
 def compress_tensor(
     tensor: torch.Tensor,
     *,
@@ -100,6 +144,76 @@ def compress_tensor(
     pin_memory: bool = False,
 ) -> torch.Tensor:
     """Compress a tensor losslessly on the GPU; returns a 1-D uint8 tensor in CPU memory."""
+    blob, _ = _compress(
+        tensor,
+        chunk_bytes=chunk_bytes,
+        sub_chunk_bytes=sub_chunk_bytes,
+        passthrough_threshold=passthrough_threshold,
+        min_compress_bytes=min_compress_bytes,
+        checksum_chunk_bytes=None,
+        pin_memory=pin_memory,
+    )
+    return blob
+
+
+def compress_tensor_with_crc32(
+    tensor: torch.Tensor,
+    *,
+    chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    sub_chunk_bytes: int = DEFAULT_SUB_CHUNK_BYTES,
+    passthrough_threshold: float = DEFAULT_PASSTHROUGH_THRESHOLD,
+    min_compress_bytes: int = DEFAULT_MIN_COMPRESS_BYTES,
+    checksum_chunk_bytes: int = DEFAULT_CHECKSUM_CHUNK_BYTES,
+    pin_memory: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """compress_tensor, plus the CRC-32 (as zlib.crc32) of each checksum_chunk_bytes-byte chunk
+    of the blob, the last one possibly shorter, as a 1-D uint32 tensor in CPU memory.
+
+    The blob is the same as compress_tensor's. The checksums are computed on the GPU before the
+    blob is copied back; hash_tensor_with_crc32(blob) reproduces them, so a blob can be verified
+    before it is passed to decompress_tensor.
+    """
+    blob, checksums = _compress(
+        tensor,
+        chunk_bytes=chunk_bytes,
+        sub_chunk_bytes=sub_chunk_bytes,
+        passthrough_threshold=passthrough_threshold,
+        min_compress_bytes=min_compress_bytes,
+        checksum_chunk_bytes=checksum_chunk_bytes,
+        pin_memory=pin_memory,
+    )
+    assert checksums is not None
+    return blob, checksums
+
+
+def hash_tensor_with_crc32(
+    tensor: torch.Tensor,
+    *,
+    checksum_chunk_bytes: int = DEFAULT_CHECKSUM_CHUNK_BYTES,
+) -> torch.Tensor:
+    """CRC-32 (as zlib.crc32) of each checksum_chunk_bytes-byte chunk of the tensor's bytes in
+    row-major order, the last one possibly shorter, computed on the GPU. Returns a 1-D uint32
+    tensor in CPU memory."""
+    if checksum_chunk_bytes <= 0:
+        raise ValueError("checksum_chunk_bytes must be positive")
+    x = tensor.detach()
+    device = _gpu(x)
+    stream = torch.cuda.current_stream(device)
+    with torch.cuda.stream(stream):
+        x = x.to(device, non_blocking=True, memory_format=torch.contiguous_format).contiguous()
+        return _crc32(x.view(-1).view(torch.uint8), checksum_chunk_bytes, stream).cpu()
+
+
+def _compress(
+    tensor: torch.Tensor,
+    *,
+    chunk_bytes: int,
+    sub_chunk_bytes: int,
+    passthrough_threshold: float,
+    min_compress_bytes: int,
+    checksum_chunk_bytes: int | None,
+    pin_memory: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     if tensor.dtype not in _CODES:
         raise TypeError(f"unsupported dtype {tensor.dtype}")
     if chunk_bytes % 8 or not 0 < chunk_bytes <= _nvcomp.MAX_CHUNK_BYTES:
@@ -112,6 +226,8 @@ def compress_tensor(
         raise ValueError("sub_chunk_bytes must be positive")
     if min_compress_bytes < 0:
         raise ValueError("min_compress_bytes must be non-negative")
+    if checksum_chunk_bytes is not None and checksum_chunk_bytes <= 0:
+        raise ValueError("checksum_chunk_bytes must be positive")
     sub_chunks = _sub_chunks(chunk_bytes, sub_chunk_bytes)
     if tensor.dim() > _MAX_NDIM:
         raise ValueError(f"at most {_MAX_NDIM} dimensions are supported")
@@ -151,13 +267,13 @@ def compress_tensor(
     if n * k < min_compress_bytes:
         header_size = _FIXED.size + 8 * tensor.dim()
         blob = header(0, size=header_size + n * k, stored=True)
-        blob[header_size:].view(x.dtype).view(x.shape).copy_(x)
-        return blob
+        return _fill_stored(blob, header_size, x, checksum_chunk_bytes)
 
     if n == 0:
-        return header(0)
+        blob = header(0)
+        return _fill_stored(blob, blob.numel(), x, checksum_chunk_bytes)
 
-    device = x.device if x.is_cuda else torch.device("cuda", torch.cuda.current_device())
+    device = _gpu(x)
     current_stream = torch.cuda.current_stream(device)
     if current_stream.cuda_stream != 0:
         stream = current_stream
@@ -262,10 +378,13 @@ def compress_tensor(
         # Only after the first pass, which reads ANS chunks from the slots this overwrites.
         comp[:data_off].copy_(prefix, non_blocking=True)
 
+        crc = None
+        if checksum_chunk_bytes is not None:
+            crc = _crc32(comp[:size], checksum_chunk_bytes, stream)
         blob = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
         blob.copy_(comp[:size], non_blocking=True)
         stream.synchronize()
-        return blob
+        return blob, None if crc is None else crc.cpu()
 
 
 def _parse_header(

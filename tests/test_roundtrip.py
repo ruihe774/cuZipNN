@@ -1,9 +1,18 @@
+import ctypes
 import math
+import zlib
 
 import pytest
 import torch
 
-from cuzipnn import _codec, _kernels, compress_tensor, decompress_tensor
+from cuzipnn import (
+    _codec,
+    _kernels,
+    compress_tensor,
+    compress_tensor_with_crc32,
+    decompress_tensor,
+    hash_tensor_with_crc32,
+)
 
 _INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 FLOAT_DTYPES = [
@@ -417,3 +426,89 @@ def test_stored_truncated():
 def test_bad_min_compress_bytes():
     with pytest.raises(ValueError, match="min_compress_bytes"):
         compress_tensor(_weights(torch.bfloat16, 100), min_compress_bytes=-1)
+
+
+def _crc32_ref(t, chunk=_codec.DEFAULT_CHECKSUM_CHUNK_BYTES):
+    t = t.detach().cpu().contiguous()
+    b = ctypes.string_at(t.data_ptr(), t.numel() * t.element_size())
+    return [zlib.crc32(b[i : i + chunk]) for i in range(0, len(b), chunk)]
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda: _weights(torch.bfloat16, 1_000_003), id="bf16"),
+        pytest.param(lambda: _weights(torch.float32, 300_001).cpu(), id="fp32-cpu"),
+        pytest.param(lambda: _mixed_int8(7), id="int8-mixed"),
+        pytest.param(lambda: _weights(torch.float16, 1000).reshape(10, 100).t(), id="fp16-t"),
+        pytest.param(lambda: torch.empty(3, 0, 5, device="cuda"), id="empty"),
+    ],
+)
+@pytest.mark.parametrize("min_compress_bytes", [0, 1 << 30])
+@pytest.mark.parametrize("checksum_chunk_bytes", [8, 1000, 16 * 1024, 1 << 30])
+def test_crc32_matches_zlib(make, min_compress_bytes, checksum_chunk_bytes):
+    # 8 divides every blob size (no short last chunk); 1 << 30 exceeds it (one short chunk).
+    x = make()
+    kw = {"chunk_bytes": CHUNK, "min_compress_bytes": min_compress_bytes}
+    blob, crc = compress_tensor_with_crc32(x, checksum_chunk_bytes=checksum_chunk_bytes, **kw)
+    assert torch.equal(blob, compress_tensor(x, **kw))
+    assert _is_stored(blob) == (min_compress_bytes > 0)
+    assert crc.dtype == torch.uint32 and crc.device.type == "cpu" and crc.dim() == 1
+    assert crc.tolist() == _crc32_ref(blob, checksum_chunk_bytes)
+
+
+def test_crc32_default_chunk():
+    assert _codec.DEFAULT_CHECKSUM_CHUNK_BYTES == 16 * 1024
+    blob, crc = compress_tensor_with_crc32(_weights(torch.bfloat16, 1_000_003))
+    assert crc.numel() == math.ceil(blob.numel() / (16 * 1024)) > 1
+    assert crc.tolist() == _crc32_ref(blob)
+
+
+def test_hash_blob_matches_checksums():
+    x = _weights(torch.bfloat16, 1_000_003)
+    blob, crc = compress_tensor_with_crc32(x, chunk_bytes=CHUNK, pin_memory=True)
+    assert blob.is_pinned()
+    padded = torch.empty(blob.numel() + 3, dtype=torch.uint8, device="cuda")
+    padded[3:] = blob
+    for view in (blob, blob.cuda(), padded[3:], torch.stack([blob, blob], 1)[:, 0]):
+        assert torch.equal(hash_tensor_with_crc32(view), crc)
+    assert torch.equal(_bits(decompress_tensor(blob)), _bits(x))
+
+
+def test_hash_tensor():
+    x = _weights(torch.float32, 30 * 40).reshape(30, 40)
+    for t in (x, x.t(), x.cpu().t(), x[::3, 1::2], torch.tensor(1.5), torch.empty(0)):
+        crc = hash_tensor_with_crc32(t, checksum_chunk_bytes=1000)
+        assert crc.dtype == torch.uint32 and crc.device.type == "cpu"
+        assert crc.tolist() == _crc32_ref(t, 1000)
+
+
+def test_crc32_detects_corruption():
+    blob, crc = compress_tensor_with_crc32(
+        _weights(torch.bfloat16, 1_000_003), chunk_bytes=CHUNK
+    )
+    for pos in (0, 16 * 1024 - 1, 16 * 1024, blob.numel() // 2, blob.numel() - 1):
+        bad = blob.clone()
+        bad[pos] ^= 1
+        diff = (hash_tensor_with_crc32(bad).to(torch.int64) != crc.to(torch.int64)).nonzero()
+        assert diff.view(-1).tolist() == [pos // (16 * 1024)]
+
+
+def test_crc32_non_default_stream():
+    x = _weights(torch.bfloat16, 1_000_003)
+    ref = compress_tensor_with_crc32(x, chunk_bytes=CHUNK)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        s.wait_stream(torch.cuda.default_stream())
+        blob, crc = compress_tensor_with_crc32(x, chunk_bytes=CHUNK)
+        assert torch.equal(hash_tensor_with_crc32(blob), crc)
+    assert torch.equal(blob, ref[0]) and torch.equal(crc, ref[1])
+
+
+@pytest.mark.parametrize("checksum_chunk_bytes", [0, -1])
+def test_bad_checksum_chunk_bytes(checksum_chunk_bytes):
+    x = _weights(torch.bfloat16, 100)
+    with pytest.raises(ValueError, match="checksum_chunk_bytes"):
+        compress_tensor_with_crc32(x, checksum_chunk_bytes=checksum_chunk_bytes)
+    with pytest.raises(ValueError, match="checksum_chunk_bytes"):
+        hash_tensor_with_crc32(x, checksum_chunk_bytes=checksum_chunk_bytes)

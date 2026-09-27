@@ -1,4 +1,4 @@
-"""Minimal ctypes bindings for nvCOMP's batched ANS (rANS entropy coder) C API."""
+"""Minimal ctypes bindings for nvCOMP's batched ANS (rANS entropy coder) and CRC32 C APIs."""
 
 import ctypes
 import importlib
@@ -41,6 +41,40 @@ _DECOMPRESS_OPTS = _DecompressOpts(0, NVCOMP_TYPE_CHAR, 0)
 
 def _compress_opts(sub_chunks: int) -> _CompressOpts:
     return _CompressOpts(0, NVCOMP_TYPE_CHAR, sub_chunks)
+
+
+# From nvcomp/crc32.h
+class _CRC32Spec(ctypes.Structure):
+    _fields_ = [
+        ("poly", ctypes.c_uint32),
+        ("init", ctypes.c_uint32),
+        ("ref_in", ctypes.c_bool),
+        ("ref_out", ctypes.c_bool),
+        ("xorout", ctypes.c_uint32),
+        ("reserved", ctypes.c_char * 16),
+    ]
+
+
+class _CRC32KernelConf(ctypes.Structure):
+    _fields_ = [
+        ("kernel_kind", ctypes.c_int),
+        ("bytes_per_read", ctypes.c_int32),
+        ("blocks_per_msg", ctypes.c_int32),
+        ("reserved", ctypes.c_char * 20),
+    ]
+
+
+class _CRC32Opts(ctypes.Structure):
+    _fields_ = [
+        ("spec", _CRC32Spec),
+        ("kernel_conf", _CRC32KernelConf),
+        ("reserved", ctypes.c_char * 64),
+    ]
+
+
+# nvcompCRC32: standard CRC-32 (PKZIP), the same as zlib.crc32.
+_CRC32 = _CRC32Spec(0x04C11DB7, 0xFFFFFFFF, True, True, 0xFFFFFFFF)
+_CRC32_ONLY_SEGMENT = 0
 
 
 # Not `import nvidia.libnvcomp`: importing nvidia.nvcomp first deletes that attribute from the namespace package.
@@ -104,6 +138,25 @@ _decompress = _bind(
     _size_t,
     _ptr,
     _DecompressOpts,
+    _ptr,
+    _ptr,
+)
+_crc32_conf = _bind(
+    "nvcompBatchedCRC32GetHeuristicConf",
+    _ptr,
+    _size_t,
+    ctypes.POINTER(_CRC32KernelConf),
+    _size_t,
+    _ptr,
+)
+_crc32 = _bind(
+    "nvcompBatchedCRC32Async",
+    _ptr,
+    _ptr,
+    _size_t,
+    _ptr,
+    _CRC32Opts,
+    ctypes.c_int,
     _ptr,
     _ptr,
 )
@@ -203,4 +256,35 @@ def decompress(
             stream,
         ),
         "DecompressAsync",
+    )
+
+
+def crc32(
+    in_ptrs: torch.Tensor,
+    in_bytes: torch.Tensor,
+    max_bytes: int,
+    out: torch.Tensor,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Asynchronously compute the CRC-32 of a batch of chunks on `stream`. All tensor arguments live on the GPU.
+
+    in_ptrs are int64 device addresses; in_bytes are int64 (size_t) chunk sizes, the largest of
+    which is `max_bytes`; out is uint32 and receives one checksum per chunk.
+    """
+    n = in_ptrs.numel()
+    conf = _CRC32KernelConf()
+    # Given max_bytes, this is a host-only lookup that does not synchronize with the device.
+    _check(_crc32_conf(None, n, ctypes.byref(conf), max_bytes, None), "CRC32GetHeuristicConf")
+    _check(
+        _crc32(
+            in_ptrs.data_ptr(),
+            in_bytes.data_ptr(),
+            n,
+            out.data_ptr(),
+            _CRC32Opts(_CRC32, conf),
+            _CRC32_ONLY_SEGMENT,
+            None,
+            stream,
+        ),
+        "CRC32Async",
     )
