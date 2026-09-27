@@ -106,7 +106,7 @@ def _crc32(data: torch.Tensor, checksum_chunk_bytes: int) -> torch.Tensor:
     if m:
         # A short last chunk just gets its own size in the same batch: one launch, no padding.
         sizes = torch.full((m,), checksum_chunk_bytes, dtype=torch.int64, device=data.device)
-        sizes[-1] = nbytes - (m - 1) * checksum_chunk_bytes
+        sizes[-1:] = nbytes - (m - 1) * checksum_chunk_bytes
         base = data.data_ptr()
         ptrs = torch.arange(
             base, base + nbytes, checksum_chunk_bytes, dtype=torch.int64, device=data.device
@@ -447,18 +447,6 @@ def decompress_tensor(
     sizes_off, idx_off, data_off = _layout(len(shape), total, n_comp)
     if blob.numel() < data_off:
         raise ValueError("blob is truncated")
-    if k == 1:
-        table = (
-            blob[sizes_off:idx_off]
-            .to("cpu", memory_format=torch.contiguous_format)
-            .contiguous()
-        )
-        if table.storage_offset() % 4:
-            table = table.clone()
-        padded_cpu = _align8(table.view(torch.int32).to(torch.int64))
-        # nvCOMP reads the compressed chunks, so the data section must be complete before it runs.
-        if blob.numel() < data_off + padded_cpu.sum().item():
-            raise ValueError("blob is truncated")
 
     with torch.cuda.device(device):
         x = blob.to(

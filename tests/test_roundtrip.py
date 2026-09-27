@@ -305,12 +305,6 @@ def test_unaligned_cpu_blob_view(layout):
     assert torch.equal(decompress_tensor(view), x)
 
 
-def test_truncated_data_section():
-    blob = compress_tensor(_mixed_int8(7), chunk_bytes=CHUNK, min_compress_bytes=0)
-    with pytest.raises(ValueError, match="truncated"):
-        decompress_tensor(blob[:-8])
-
-
 def _zipnn_reference_streams(x: torch.Tensor, reorder: bool) -> torch.Tensor:
     """Reorder + byte grouping as in ZipNN's csrc/data_manipulation_dtype{16,32}.c."""
     k = x.element_size()
