@@ -343,13 +343,13 @@ def _compress(
 
         # Pack in two passes, so that no pass reads from the buffer it writes to. First move the
         # ANS chunks out of comp: into their own planar region, which is dead once the chunk is
-        # compressed, or for K = 1 (planar may be the caller's tensor) into a temporary buffer.
+        # compressed, or into a temporary buffer if planar is the caller's tensor (K = 1).
         in_ptrs = torch.arange(
             in_start, in_start + total * chunk_bytes, chunk_bytes, dtype=torch.int64
         )
         out_ptrs = torch.arange(out_start, out_start + total * slot, slot, dtype=torch.int64)
         comp_stored = torch.where(use, stored, 0)
-        if k == 1:
+        if in_start == tensor.data_ptr():
             comp_padded = _align8(comp_stored)
             temp = torch.empty(int(comp_padded.sum()), dtype=torch.uint8, device=device)
             home = temp.data_ptr() + torch.cumsum(comp_padded, 0) - comp_padded
