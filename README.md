@@ -24,6 +24,20 @@ assert torch.equal(out, t)
 
 Supported dtypes: `bool`, `uint8`/`16`/`32`/`64`, `int8`/`16`/`32`/`64`, `float16`, `bfloat16`, `float32`, `float64`, `float8_e4m3fn`, `float8_e5m2`, and `complex64`. The blob records dtype and shape; a non-contiguous input is compressed in row-major order.
 
+## Performance
+
+Whole-model round trips against [ZipNN](https://github.com/zipnn/zipnn) 0.5.4, both with default settings. Ratio is compressed / original size (lower is better). Throughput is original bytes per second (GB = 10⁹ bytes).
+
+| Model | dtype | Size | Ratio<br>ZipNN / cuZipNN | Compress GB/s<br>ZipNN / cuZipNN | Decompress GB/s<br>ZipNN / cuZipNN |
+|---|---|---:|---:|---:|---:|
+| [Qwen2.5-7B](https://huggingface.co/Qwen/Qwen2.5-7B) | BF16 | 15.2 GB | 66.7% / 67.2% | 7.7 / **15.1** | 21.5 / **36.0** |
+| [flan-t5-xl](https://huggingface.co/google/flan-t5-xl) | FP32 | 11.4 GB | 83.2% / 83.5% | 6.2 / **12.5** | 21.2 / **29.5** |
+| [gpt2-xl](https://huggingface.co/openai-community/gpt2-xl) | FP32 | 6.4 GB | 80.7% / 81.0% | 6.2 / **11.6** | 20.5 / **27.8** |
+| [whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) | FP16 | 3.1 GB | 85.0% / 85.6% | 3.9 / **8.4** | 7.1 / **15.9** |
+| [Qwen3-4B-FP8](https://huggingface.co/Qwen/Qwen3-4B-FP8) | FP8 + BF16 | 5.2 GB | 78.1% / 79.7% | 6.0 / **12.2** | 11.8 / **27.2** |
+
+Measured on an NVIDIA GB10 (DGX Spark: 20-core Grace CPU with memory shared with the GPU), one tensor at a time, best of two passes. ZipNN goes from a CPU tensor to bytes and back, using 16 threads. cuZipNN goes from a GPU tensor to a CPU blob and back to the GPU, so its times include both transfers. On a discrete GPU, those transfers go over PCIe instead.
+
 ## API
 
 ### `compress_tensor(tensor, *, chunk_bytes=131072, sub_chunk_bytes=8192, passthrough_threshold=0.95, min_compress_bytes=65536, pin_memory=False) -> Tensor`
