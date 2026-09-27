@@ -185,9 +185,8 @@ def compress(
     out_bytes: torch.Tensor,
     statuses: torch.Tensor,
     sub_chunks: int,
-    stream: torch.cuda.Stream,
 ) -> None:
-    """Asynchronously ANS-compress a batch of chunks on `stream`. All tensor arguments live on the GPU.
+    """Asynchronously ANS-compress a batch of chunks on the current stream. All tensor arguments live on the GPU.
 
     in_ptrs/out_ptrs are int64 device addresses; in_bytes/out_bytes are int64 (size_t);
     statuses is int32 and receives one nvcompStatus_t per chunk. Each chunk is coded as
@@ -213,7 +212,7 @@ def compress(
             out_bytes.data_ptr(),
             opts,
             statuses.data_ptr(),
-            stream,
+            torch.cuda.current_stream(in_ptrs.device),
         ),
         "CompressAsync",
     )
@@ -226,9 +225,8 @@ def decompress(
     chunk_bytes: int,
     total_bytes: int,
     out_ptrs: torch.Tensor,
-    stream: torch.cuda.Stream,
 ) -> None:
-    """Asynchronously decompress a batch of ANS chunks on `stream`. All tensor arguments live on the GPU."""
+    """Asynchronously decompress a batch of ANS chunks on the current stream. All tensor arguments live on the GPU."""
     n = in_ptrs.numel()
     device = in_ptrs.device
     temp_bytes = _size_t()
@@ -253,7 +251,7 @@ def decompress(
             out_ptrs.data_ptr(),
             _DECOMPRESS_OPTS,
             statuses.data_ptr(),
-            stream,
+            torch.cuda.current_stream(in_ptrs.device),
         ),
         "DecompressAsync",
     )
@@ -264,9 +262,8 @@ def crc32(
     in_bytes: torch.Tensor,
     max_bytes: int,
     out: torch.Tensor,
-    stream: torch.cuda.Stream,
 ) -> None:
-    """Asynchronously compute the CRC-32 of a batch of chunks on `stream`. All tensor arguments live on the GPU.
+    """Asynchronously compute the CRC-32 of a batch of chunks on the current stream. All tensor arguments live on the GPU.
 
     in_ptrs are int64 device addresses; in_bytes are int64 (size_t) chunk sizes, the largest of
     which is `max_bytes`; out is uint32 and receives one checksum per chunk.
@@ -284,7 +281,7 @@ def crc32(
             _CRC32Opts(_CRC32, conf),
             _CRC32_ONLY_SEGMENT,
             None,
-            stream,
+            torch.cuda.current_stream(in_ptrs.device),
         ),
         "CRC32Async",
     )

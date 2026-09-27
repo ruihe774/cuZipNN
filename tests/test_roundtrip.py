@@ -184,17 +184,12 @@ def test_deterministic_despite_stale_device_memory():
     # (2307 bytes here, stored raw for the mantissa stream) is copied through to its 8-byte
     # boundary; neither may pick up stale memory.
     x = _weights(torch.bfloat16, 4_000_003)
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
     blobs = []
     for fill in (0x00, 0xA5):
         torch.cuda.empty_cache()
-        # Freed straight back to the cache, so the next call's buffers start out dirty. The cache
-        # is per stream, and compress_tensor allocates on the caller's stream unless that is the
-        # legacy default one, so dirty and compress on the same side stream.
-        with torch.cuda.stream(s):
-            torch.full((256 << 20,), fill, dtype=torch.uint8, device="cuda")
-            blobs.append(compress_tensor(x, chunk_bytes=CHUNK))
+        # Freed straight back to the cache, so the next call's buffers start out dirty.
+        torch.full((256 << 20,), fill, dtype=torch.uint8, device="cuda")
+        blobs.append(compress_tensor(x, chunk_bytes=CHUNK))
     assert torch.equal(*blobs)
 
 

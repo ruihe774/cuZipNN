@@ -95,11 +95,9 @@ def _gpu(x: torch.Tensor) -> torch.device:
     return x.device if x.is_cuda else torch.device("cuda", torch.cuda.current_device())
 
 
-def _crc32(
-    data: torch.Tensor, checksum_chunk_bytes: int, stream: torch.cuda.Stream
-) -> torch.Tensor:
+def _crc32(data: torch.Tensor, checksum_chunk_bytes: int) -> torch.Tensor:
     """Enqueue the CRC-32 of each checksum_chunk_bytes-byte chunk of `data`, a contiguous uint8
-    CUDA tensor, on `stream`. The last chunk may be shorter. Returns uint32 on the GPU."""
+    CUDA tensor. The last chunk may be shorter. Returns uint32 on the GPU."""
     nbytes = data.numel()
     m = triton.cdiv(nbytes, checksum_chunk_bytes)
     crc = torch.empty(m, dtype=torch.uint32, device=data.device)
@@ -110,7 +108,7 @@ def _crc32(
         base = data.data_ptr()
         ptrs = torch.arange(base, base + nbytes, checksum_chunk_bytes, dtype=torch.int64)
         tbl = torch.stack([ptrs, sizes]).to(data.device, non_blocking=True)
-        _nvcomp.crc32(tbl[0], tbl[1], min(checksum_chunk_bytes, nbytes), crc, stream)
+        _nvcomp.crc32(tbl[0], tbl[1], min(checksum_chunk_bytes, nbytes), crc)
     return crc
 
 
@@ -123,14 +121,12 @@ def _fill_stored(
         blob[offset:].view(x.dtype).view(x.shape).copy_(x)
         return blob, None
     device = _gpu(x)
-    stream = torch.cuda.current_stream(device)
-    with torch.cuda.stream(stream):
+    with torch.cuda.device(device):
         buf = torch.empty(blob.numel(), dtype=torch.uint8, device=device)
         buf[:offset].copy_(blob[:offset], non_blocking=True)
         buf[offset:].view(x.dtype).view(x.shape).copy_(x, non_blocking=True)
-        crc = _crc32(buf, checksum_chunk_bytes, stream)
-        blob.copy_(buf, non_blocking=True)
-        stream.synchronize()
+        crc = _crc32(buf, checksum_chunk_bytes)
+        blob.copy_(buf)
         return blob, crc.cpu()
 
 
@@ -198,10 +194,9 @@ def hash_tensor_with_crc32(
         raise ValueError("checksum_chunk_bytes must be positive")
     x = tensor.detach()
     device = _gpu(x)
-    stream = torch.cuda.current_stream(device)
-    with torch.cuda.stream(stream):
+    with torch.cuda.device(device):
         x = x.to(device, non_blocking=True, memory_format=torch.contiguous_format).contiguous()
-        return _crc32(x.view(-1).view(torch.uint8), checksum_chunk_bytes, stream).cpu()
+        return _crc32(x.view(-1).view(torch.uint8), checksum_chunk_bytes).cpu()
 
 
 def _compress(
@@ -274,14 +269,7 @@ def _compress(
         return _fill_stored(blob, blob.numel(), x, checksum_chunk_bytes)
 
     device = _gpu(x)
-    current_stream = torch.cuda.current_stream(device)
-    if current_stream.cuda_stream != 0:
-        stream = current_stream
-    else:
-        stream = torch.cuda.Stream(device)
-        stream.wait_stream(current_stream)
-
-    with torch.cuda.stream(stream):
+    with torch.cuda.device(device):
         x = (
             x.to(device, non_blocking=True, memory_format=torch.contiguous_format)
             .contiguous()
@@ -331,7 +319,6 @@ def _compress(
             comp_bytes,
             statuses,
             sub_chunks,
-            stream,
         )
 
         raw_bytes = _raw_bytes(k, nch, n, chunk_bytes, 1, "cpu")
@@ -380,10 +367,9 @@ def _compress(
 
         crc = None
         if checksum_chunk_bytes is not None:
-            crc = _crc32(comp[:size], checksum_chunk_bytes, stream)
+            crc = _crc32(comp[:size], checksum_chunk_bytes)
         blob = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
-        blob.copy_(comp[:size], non_blocking=True)
-        stream.synchronize()
+        blob.copy_(comp[:size])
         return blob, None if crc is None else crc.cpu()
 
 
@@ -470,14 +456,7 @@ def decompress_tensor(
         if blob.numel() < data_off + padded_cpu.sum().item():
             raise ValueError("blob is truncated")
 
-    current_stream = torch.cuda.current_stream(device)
-    if current_stream.cuda_stream != 0:
-        stream = current_stream
-    else:
-        stream = torch.cuda.Stream(device)
-        stream.wait_stream(current_stream)
-
-    with torch.cuda.stream(stream):
+    with torch.cuda.device(device):
         x = blob.to(
             device, non_blocking=True, memory_format=torch.contiguous_format
         ).contiguous()
@@ -486,7 +465,7 @@ def decompress_tensor(
         # A pinned blob is uploaded asynchronously, but the caller may reuse it once we return.
         uploaded = torch.cuda.Event() if blob.is_pinned() else None
         if uploaded is not None:
-            uploaded.record(stream)
+            uploaded.record()
 
         stored = x[sizes_off:idx_off].view(torch.int32).to(torch.int64)
         comp_idx = x[idx_off : idx_off + 4 * n_comp].view(torch.int32).to(torch.int64)
@@ -517,7 +496,6 @@ def decompress_tensor(
                 chunk_bytes,
                 n_comp * chunk_bytes,
                 slots[comp_idx],
-                stream,
             )
 
         if k == 1:
@@ -529,7 +507,6 @@ def decompress_tensor(
             tbl = src.index_copy(0, comp_idx, slots[comp_idx]) - planar_base
             _kernels.merge(tbl, planar, out.view(-1), chunk_bytes, reorder)
 
-        current_stream.wait_stream(stream)
         if uploaded is not None:
             uploaded.synchronize()
         return out.to(out_device)
