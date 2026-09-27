@@ -22,6 +22,7 @@ Chunk j of every stream covers elements [j * chunk_bytes, (j + 1) * chunk_bytes)
 
 import ctypes
 import struct
+import zlib
 from collections.abc import Buffer
 
 import torch
@@ -117,19 +118,16 @@ def _fill_stored(
     blob: torch.Tensor, offset: int, x: torch.Tensor, checksum_chunk_bytes: int | None
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Copy x's bytes into blob[offset:], after blob's header. With checksum_chunk_bytes, the blob
-    is assembled and hashed on the GPU before it is copied back."""
+    is hashed on the CPU with zlib: it is below min_compress_bytes, so a GPU round trip costs more."""
+    blob[offset:].view(x.dtype).view(x.shape).copy_(x)
     if checksum_chunk_bytes is None:
-        blob[offset:].view(x.dtype).view(x.shape).copy_(x)
         return blob, None
-    device = _gpu(x)
-    with torch.cuda.device(device):
-        buf = torch.empty(blob.numel(), dtype=torch.uint8, device=device)
-        buf[:offset].copy_(blob[:offset], non_blocking=True)
-        buf[offset:].view(x.dtype).view(x.shape).copy_(x, non_blocking=True)
-        crc = _crc32(buf, checksum_chunk_bytes)
-        # crc.cpu() below syncs the stream, so blob is complete on return.
-        blob.copy_(buf, non_blocking=True)
-        return blob, crc.cpu()
+    data = memoryview((ctypes.c_char * blob.numel()).from_address(blob.data_ptr()))
+    crc = [
+        zlib.crc32(data[i : i + checksum_chunk_bytes])
+        for i in range(0, len(data), checksum_chunk_bytes)
+    ]
+    return blob, torch.tensor(crc, dtype=torch.uint32)
 
 
 def compress_tensor(
@@ -168,8 +166,9 @@ def compress_tensor_with_crc32(
     of the blob, the last one possibly shorter, as a 1-D uint32 tensor in CPU memory.
 
     The blob is the same as compress_tensor's. The checksums are computed on the GPU before the
-    blob is copied back; hash_tensor_with_crc32(blob) reproduces them, so a blob can be verified
-    before it is passed to decompress_tensor.
+    blob is copied back (on the CPU for tensors below min_compress_bytes, which are stored
+    uncompressed); hash_tensor_with_crc32(blob) reproduces them, so a blob can be verified before
+    it is passed to decompress_tensor.
     """
     blob, checksums = _compress(
         tensor,
