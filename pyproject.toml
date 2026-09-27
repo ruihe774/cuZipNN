@@ -1,15 +1,42 @@
 [project]
 name = "cuzipnn"
 version = "0.1.0"
-requires-python = ">=3.13,<4"
+description = "GPU implementation of ZipNN lossless tensor compression, using Triton and nvCOMP"
+readme = "README.md"
+requires-python = ">=3.12"
 license = "Unlicense"
+license-files = ["LICENSE"]
 authors = [
     {name = "Rui He", email = "ruihe774@outlook.com"},
 ]
-dependencies = [
-    "torch~=2.14.0",
-    "nvidia-libnvcomp-cu13~=5.3",
+keywords = ["zipnn", "compression", "lossless", "tensor", "cuda", "gpu", "pytorch", "nvcomp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Archiving :: Compression",
+    "Typing :: Typed",
 ]
+dependencies = [
+    # 2.9 is the first release with CUDA 13 wheels, which nvCOMP's cu13 build needs.
+    "torch>=2.9",
+    # Imported directly; torch pins a matching version on Linux.
+    "triton>=3.5",
+    # 5.3 adds ANS max_sub_chunk_count; _nvcomp.py loads libnvcomp.so.5 with its struct layouts.
+    "nvidia-libnvcomp-cu13>=5.3,<6",
+]
+
+[project.urls]
+Homepage = "https://github.com/ruihe774/cuZipNN"
+Issues = "https://github.com/ruihe774/cuZipNN/issues"
 
 [build-system]
 requires = ["uv_build~=0.12"]
@@ -29,4 +56,4 @@ dev = [
 
 [tool.ruff]
 line-length = 96
-target-version = "py313"
+target-version = "py312"
