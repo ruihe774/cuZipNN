@@ -103,12 +103,13 @@ def _crc32(data: torch.Tensor, checksum_chunk_bytes: int) -> torch.Tensor:
     crc = torch.empty(m, dtype=torch.uint32, device=data.device)
     if m:
         # A short last chunk just gets its own size in the same batch: one launch, no padding.
-        sizes = torch.full((m,), checksum_chunk_bytes, dtype=torch.int64)
+        sizes = torch.full((m,), checksum_chunk_bytes, dtype=torch.int64, device=data.device)
         sizes[-1] = nbytes - (m - 1) * checksum_chunk_bytes
         base = data.data_ptr()
-        ptrs = torch.arange(base, base + nbytes, checksum_chunk_bytes, dtype=torch.int64)
-        tbl = torch.stack([ptrs, sizes]).to(data.device, non_blocking=True)
-        _nvcomp.crc32(tbl[0], tbl[1], min(checksum_chunk_bytes, nbytes), crc)
+        ptrs = torch.arange(
+            base, base + nbytes, checksum_chunk_bytes, dtype=torch.int64, device=data.device
+        )
+        _nvcomp.crc32(ptrs, sizes, min(checksum_chunk_bytes, nbytes), crc)
     return crc
 
 
@@ -126,7 +127,8 @@ def _fill_stored(
         buf[:offset].copy_(blob[:offset], non_blocking=True)
         buf[offset:].view(x.dtype).view(x.shape).copy_(x, non_blocking=True)
         crc = _crc32(buf, checksum_chunk_bytes)
-        blob.copy_(buf)
+        # crc.cpu() below syncs the stream, so blob is complete on return.
+        blob.copy_(buf, non_blocking=True)
         return blob, crc.cpu()
 
 
@@ -369,7 +371,8 @@ def _compress(
         if checksum_chunk_bytes is not None:
             crc = _crc32(comp[:size], checksum_chunk_bytes)
         blob = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
-        blob.copy_(comp[:size])
+        # With a crc, crc.cpu() below syncs the stream, so blob is complete on return.
+        blob.copy_(comp[:size], non_blocking=crc is not None)
         return blob, None if crc is None else crc.cpu()
 
 
