@@ -161,6 +161,19 @@ def test_decompress_to_cpu(n):
     for b in (blob, blob.cuda()):
         y = decompress_tensor(b, device="cpu")
         assert y.device.type == "cpu" and y.shape == x.shape
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int8, torch.complex64])
+@pytest.mark.parametrize("min_compress_bytes", [0, _codec.DEFAULT_MIN_COMPRESS_BYTES])
+def test_decompress_0dim_to_cpu(dtype, min_compress_bytes):
+    # A 0-dim tensor cannot be viewed as a dtype of another element size.
+    x = torch.tensor(1.5, device="cuda").to(dtype)
+    blob = compress_tensor(x, min_compress_bytes=min_compress_bytes)
+    assert _is_stored(blob) == (min_compress_bytes > 0)
+    for b in (blob, blob.cuda()):
+        y = decompress_tensor(b, device="cpu")
+        assert y.device.type == "cpu" and y.dtype == dtype and y.shape == ()
+        assert torch.equal(_bits(y), _bits(x).cpu())
         assert torch.equal(_bits(x.cpu()), _bits(y))
 
 

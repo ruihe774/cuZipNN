@@ -21,6 +21,7 @@ Chunk j of every stream covers elements [j * chunk_bytes, (j + 1) * chunk_bytes)
 """
 
 import ctypes
+import math
 import struct
 import zlib
 from collections.abc import Buffer
@@ -238,10 +239,8 @@ def _compress(
         shape_spec = struct.Struct(f"<{tensor.dim()}q")
         header_size = _FIXED.size + shape_spec.size
         assert header_size == 24 + 8 * tensor.dim()  # sanity check
-        r = torch.empty(
+        r = _populated_empty(
             header_size if size is None else size,
-            dtype=torch.uint8,
-            device="cpu",
             pin_memory=pin_memory,
         )
         b = (ctypes.c_byte * r.numel()).from_address(r.data_ptr())
@@ -369,7 +368,7 @@ def _compress(
         crc = None
         if checksum_chunk_bytes is not None:
             crc = _crc32(comp[:size], checksum_chunk_bytes)
-        blob = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
+        blob = _populated_empty(size, pin_memory=pin_memory)
         # With a crc, crc.cpu() below syncs the stream, so blob is complete on return.
         blob.copy_(comp[:size], non_blocking=crc is not None)
         return blob, None if crc is None else crc.cpu()
@@ -423,10 +422,13 @@ def decompress_tensor(
     if flags & _FLAG_STORED:
         # Stored uncompressed: copy the bytes after the header straight to the target device.
         header_size = _FIXED.size + 8 * len(shape)
-        out = torch.empty(shape, dtype=dtype, device=device)
-        nbytes = out.numel() * out.element_size()
+        nbytes = math.prod(shape) * dtype.itemsize
         if blob.numel() < header_size + nbytes:
             raise ValueError("blob is truncated")
+        if device.type == "cpu":
+            out = _populated_empty(nbytes).view(dtype).view(shape)
+        else:
+            out = torch.empty(shape, dtype=dtype, device=device)
         out.view(-1).view(torch.uint8).copy_(blob[header_size : header_size + nbytes])
         return out
 
@@ -511,4 +513,25 @@ def decompress_tensor(
 
         if uploaded is not None:
             uploaded.synchronize()
+
+        if out_device.type == "cpu":
+            src = out
+            out = (
+                _populated_empty(src.numel() * src.element_size(), device=out_device)
+                .view(src.dtype)
+                .view_as(src)
+            )
+            out.copy_(src)
+
         return out.to(out_device)
+
+
+def _populated_empty(
+    size: int, *, pin_memory: bool = False, device: torch.device | str = "cpu"
+) -> torch.Tensor:
+    device = torch.device(device)
+    t = torch.empty(size, dtype=torch.uint8, device=device, pin_memory=pin_memory)
+    if not pin_memory:
+        # There are other page sizes, but all >= 4KB.
+        t[::4096].fill_(1)
+    return t
