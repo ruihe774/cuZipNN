@@ -38,7 +38,7 @@ _MAX_NDIM = 64
 
 DEFAULT_CHUNK_BYTES = 128 * 1024
 DEFAULT_SUB_CHUNK_BYTES = 8 * 1024
-DEFAULT_THRESHOLD = 0.95
+DEFAULT_PASSTHROUGH_THRESHOLD = 0.95
 DEFAULT_MIN_COMPRESS_BYTES = 64 * 1024
 
 _DTYPES = {
@@ -95,7 +95,7 @@ def compress_tensor(
     *,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     sub_chunk_bytes: int = DEFAULT_SUB_CHUNK_BYTES,
-    threshold: float = DEFAULT_THRESHOLD,
+    passthrough_threshold: float = DEFAULT_PASSTHROUGH_THRESHOLD,
     min_compress_bytes: int = DEFAULT_MIN_COMPRESS_BYTES,
     pin_memory: bool = False,
 ) -> torch.Tensor:
@@ -106,8 +106,8 @@ def compress_tensor(
         raise ValueError(
             f"chunk_bytes must be a multiple of 8 in (0, {_nvcomp.MAX_CHUNK_BYTES}]"
         )
-    if threshold <= 0 or threshold > 1:
-        raise ValueError("threshold must be in (0, 1]")
+    if passthrough_threshold <= 0 or passthrough_threshold > 1:
+        raise ValueError("passthrough_threshold must be in (0, 1]")
     if sub_chunk_bytes <= 0:
         raise ValueError("sub_chunk_bytes must be positive")
     if min_compress_bytes < 0:
@@ -214,7 +214,7 @@ def compress_tensor(
         )
 
         raw_bytes = _raw_bytes(k, nch, n, chunk_bytes, 1, "cpu")
-        threshold_bytes = _raw_bytes(k, nch, n, chunk_bytes, threshold, "cpu")
+        threshold_bytes = _raw_bytes(k, nch, n, chunk_bytes, passthrough_threshold, "cpu")
         # Keep a chunk compressed only if it saves enough; otherwise store it raw (ZipNN's threshold rule).
         comp_bytes = torch.where(
             statuses == _nvcomp.NVCOMP_SUCCESS, comp_bytes, _nvcomp.MAX_CHUNK_BYTES

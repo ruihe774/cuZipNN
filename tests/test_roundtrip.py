@@ -196,7 +196,7 @@ def test_deterministic_despite_bytes_past_view():
     blobs = []
     for fill in (0x00, 0xA5):
         base[CHUNK + 3 :] = fill
-        blobs.append(_assert_roundtrip(x, chunk_bytes=CHUNK, threshold=_ALL_RAW))
+        blobs.append(_assert_roundtrip(x, chunk_bytes=CHUNK, passthrough_threshold=_ALL_RAW))
     assert torch.equal(*blobs)
 
 
@@ -212,14 +212,16 @@ def test_non_default_stream():
 
 def test_tiny_threshold_stores_everything_raw():
     x = _weights(torch.bfloat16, 100_000)
-    blob = _assert_roundtrip(x, chunk_bytes=CHUNK, threshold=_ALL_RAW)
+    blob = _assert_roundtrip(x, chunk_bytes=CHUNK, passthrough_threshold=_ALL_RAW)
     assert blob.numel() >= 200_000
 
 
-@pytest.mark.parametrize("threshold", [0.0, -0.5, 1.01])
-def test_bad_threshold(threshold):
-    with pytest.raises(ValueError, match="threshold"):
-        compress_tensor(_weights(torch.bfloat16, 100), threshold=threshold)
+@pytest.mark.parametrize("passthrough_threshold", [0.0, -0.5, 1.01])
+def test_bad_threshold(passthrough_threshold):
+    with pytest.raises(ValueError, match="passthrough_threshold"):
+        compress_tensor(
+            _weights(torch.bfloat16, 100), passthrough_threshold=passthrough_threshold
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
