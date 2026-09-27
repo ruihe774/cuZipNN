@@ -88,7 +88,6 @@ name = "cuzipnn"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "cuda-pathfinder" },
     { name = "nvidia-libnvcomp-cu13" },
     { name = "torch" },
 ]
@@ -102,7 +101,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cuda-pathfinder", specifier = "~=1.6" },
     { name = "nvidia-libnvcomp-cu13", specifier = "~=5.3" },
     { name = "torch", specifier = "~=2.14.0" },
 ]

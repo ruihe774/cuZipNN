@@ -3,8 +3,8 @@
 GPU ZipNN tensor codec. Public API is `compress_tensor` / `decompress_tensor` in `src/cuzipnn/_codec.py`.
 
 - `_codec.py`: blob format (documented in module docstring) and orchestration
-- `_kernels.py`: Triton byte-split/merge kernels
-- `_nvcomp.py`, `_cudart.py`: minimal ctypes bindings
+- `_kernels.py`: Triton byte-split/merge and chunk-copy kernels
+- `_nvcomp.py`: minimal ctypes bindings
 
 Commands (use `uv run`):
 - `pytest` — tests need a CUDA GPU

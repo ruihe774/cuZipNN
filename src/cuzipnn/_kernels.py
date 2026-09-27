@@ -1,4 +1,4 @@
-"""Triton kernels for ZipNN's bit reordering and byte grouping."""
+"""Triton kernels for ZipNN's bit reordering, byte grouping, and chunk packing."""
 
 import torch
 import triton
@@ -6,6 +6,7 @@ import triton.language as tl
 
 _SPLIT_BLOCK = 1024
 _MERGE_BLOCK = 4096
+_COPY_BLOCK = 1024  # 8-byte words
 _UNSIGNED = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32, 8: torch.uint64}
 
 
@@ -104,6 +105,32 @@ def _merge_kernel(
         )
 
 
+@triton.jit
+def _copy_chunks_kernel(src_tbl, dst_tbl, nbytes_ptr, PAD: tl.constexpr, BLOCK: tl.constexpr):
+    """Copy chunk i (nbytes[i] bytes) from src_tbl[i] to dst_tbl[i]; both addresses are 8-byte aligned.
+
+    With PAD, the destination is zero-filled up to the next multiple of 8 bytes.
+    """
+    i = tl.program_id(0)
+    t = tl.program_id(1)
+    nb = tl.load(nbytes_ptr + i)
+    if t * BLOCK * 8 < nb:
+        src = tl.load(src_tbl + i)
+        dst = tl.load(dst_tbl + i)
+        nw = nb // 8
+        w = t * BLOCK + tl.arange(0, BLOCK)
+        m = w < nw
+        v = tl.load(src.to(tl.pointer_type(tl.uint64)) + w, mask=m)
+        tl.store(dst.to(tl.pointer_type(tl.uint64)) + w, v, mask=m)
+        if (nb > nw * 8) & (t == nw // BLOCK):
+            k = nw * 8 + tl.arange(0, 8)
+            b = tl.load(src.to(tl.pointer_type(tl.uint8)) + k, mask=k < nb, other=0)
+            if PAD:
+                tl.store(dst.to(tl.pointer_type(tl.uint8)) + k, b)
+            else:
+                tl.store(dst.to(tl.pointer_type(tl.uint8)) + k, b, mask=k < nb)
+
+
 def split(x: torch.Tensor, planar: torch.Tensor, stride: int, reorder: bool) -> None:
     n = x.numel()
     k = x.element_size()
@@ -147,3 +174,15 @@ def merge(
         # 4 elements per thread; 2-5% faster than 8 warps for 2/4/8-byte dtypes on GB10.
         num_warps=32,  # pyright: ignore[reportCallIssue]
     )
+
+
+def copy_chunks(
+    src_tbl: torch.Tensor,
+    dst_tbl: torch.Tensor,
+    nbytes: torch.Tensor,
+    max_bytes: int,
+    pad: bool,
+) -> None:
+    """src_tbl/dst_tbl hold int64 device addresses; a chunk with nbytes 0 is skipped."""
+    grid = (src_tbl.numel(), triton.cdiv(max_bytes, 8 * _COPY_BLOCK))
+    _copy_chunks_kernel[grid](src_tbl, dst_tbl, nbytes, PAD=pad, BLOCK=_COPY_BLOCK, num_warps=4)  # pyright: ignore[reportCallIssue]

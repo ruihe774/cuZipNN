@@ -27,7 +27,7 @@ from collections.abc import Buffer
 import torch
 import triton
 
-from . import _cudart, _kernels, _nvcomp
+from . import _kernels, _nvcomp
 
 _MAGIC = b"ZNNG"
 _VERSION = 2
@@ -191,9 +191,14 @@ def compress_tensor(
             device=device,
         )
         slot = _align8(_nvcomp.max_compressed_chunk_bytes(chunk_bytes, sub_chunks))
+        # The blob is packed into this buffer at the end. Stored chunks are never larger than
+        # raw ones, so it also fits the header and tables.
+        head = _align8(24 + 8 * tensor.dim() + 8 * total)
         # Zeroed: nvCOMP's rANS leaves some bytes within comp_bytes unwritten, which would
         # otherwise leak stale device memory into the blob and make it non-deterministic.
-        comp = torch.zeros(total * slot, dtype=torch.uint8, device=device)
+        comp = torch.zeros(
+            max(total * slot, head + total * chunk_bytes), dtype=torch.uint8, device=device
+        )
         out_start = comp.data_ptr()
         out_ptrs = torch.arange(
             out_start, out_start + total * slot, slot, dtype=torch.int64, device=device
@@ -227,37 +232,39 @@ def compress_tensor(
         n_comp = comp_idx.numel()
 
         sizes_off, idx_off, data_off = _layout(tensor.dim(), total, n_comp)
-        blob = header(n_comp, size=data_off + int(ends[-1]))
-        blob[sizes_off:idx_off].view(torch.int32).copy_(stored)
-        blob[idx_off : idx_off + 4 * n_comp].view(torch.int32).copy_(comp_idx)
-        blob[idx_off + 4 * n_comp : data_off].zero_()
+        size = data_off + int(ends[-1])
+        prefix = header(n_comp, size=data_off)
+        prefix[sizes_off:idx_off].view(torch.int32).copy_(stored)
+        prefix[idx_off : idx_off + 4 * n_comp].view(torch.int32).copy_(comp_idx)
+        prefix[idx_off + 4 * n_comp :].zero_()
 
+        # Pack in two passes, so that no pass reads from the buffer it writes to. First move the
+        # ANS chunks out of comp: into their own planar region, which is dead once the chunk is
+        # compressed, or for K = 1 (planar may be the caller's tensor) into a temporary buffer.
         in_ptrs = torch.arange(
-            in_start,
-            in_start + total * chunk_bytes,
-            chunk_bytes,
-            dtype=torch.int64,
-            device="cpu",
+            in_start, in_start + total * chunk_bytes, chunk_bytes, dtype=torch.int64
         )
-        out_ptrs = torch.arange(
-            out_start, out_start + total * slot, slot, dtype=torch.int64, device="cpu"
-        )
-        src = torch.where(use, out_ptrs, in_ptrs)
-        dst = blob.data_ptr() + data_off + (ends - padded)
-        # One copy per run of chunks that are back to back in both the source and the blob
-        # (consecutive raw chunks), which collapses incompressible streams into a few copies.
-        head = torch.ones(total, dtype=torch.bool)
-        head[1:] = src[:-1] + padded[:-1] != src[1:]
-        last = head.roll(-1)
-        _cudart.memcpy_batch(dst[head], src[head], dst[last] + padded[last] - dst[head], stream)
-        stream.synchronize()
+        out_ptrs = torch.arange(out_start, out_start + total * slot, slot, dtype=torch.int64)
+        comp_stored = torch.where(use, stored, 0)
+        if k == 1:
+            comp_padded = _align8(comp_stored)
+            temp = torch.empty(int(comp_padded.sum()), dtype=torch.uint8, device=device)
+            home = temp.data_ptr() + torch.cumsum(comp_padded, 0) - comp_padded
+        else:
+            home = in_ptrs
+        # Then pack every chunk into comp, zero-filling each chunk's padding.
+        dst = out_start + data_off + ends - padded
+        tbl = torch.stack(
+            [out_ptrs, home, comp_stored, torch.where(use, home, in_ptrs), dst, stored]
+        ).to(device, non_blocking=True)
+        _kernels.copy_chunks(tbl[0], tbl[1], tbl[2], chunk_bytes, pad=False)
+        _kernels.copy_chunks(tbl[3], tbl[4], tbl[5], chunk_bytes, pad=True)
+        # Only after the first pass, which reads ANS chunks from the slots this overwrites.
+        comp[:data_off].copy_(prefix, non_blocking=True)
 
-        # The copies run through each chunk's 8-byte padding, which picks up whatever follows it
-        # in the source; keep only the stored bytes of each chunk's last word.
-        tail = stored % 8
-        part = tail.nonzero().view(-1)
-        words = blob[data_off:].view(torch.int64)
-        words[ends[part] // 8 - 1] &= (1 << 8 * tail[part]) - 1
+        blob = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
+        blob.copy_(comp[:size], non_blocking=True)
+        stream.synchronize()
         return blob
 
 
@@ -331,22 +338,18 @@ def decompress_tensor(
     sizes_off, idx_off, data_off = _layout(len(shape), total, n_comp)
     if blob.numel() < data_off:
         raise ValueError("blob is truncated")
-    # For k == 1: (stored bytes, padded bytes, comp_idx) of every chunk, on the CPU.
-    cpu_table: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     if k == 1:
         table = (
-            blob[sizes_off : idx_off + 4 * n_comp]
+            blob[sizes_off:idx_off]
             .to("cpu", memory_format=torch.contiguous_format)
             .contiguous()
         )
         if table.storage_offset() % 4:
             table = table.clone()
-        stored_cpu = table[: 4 * total].view(torch.int32).to(torch.int64)
-        padded_cpu = _align8(stored_cpu)
+        padded_cpu = _align8(table.view(torch.int32).to(torch.int64))
         # nvCOMP reads the compressed chunks, so the data section must be complete before it runs.
         if blob.numel() < data_off + padded_cpu.sum().item():
             raise ValueError("blob is truncated")
-        cpu_table = stored_cpu, padded_cpu, table[4 * total :].view(torch.int32)
 
     current_stream = torch.cuda.current_stream(device)
     if current_stream.cuda_stream != 0:
@@ -398,33 +401,10 @@ def decompress_tensor(
                 stream,
             )
 
-        if cpu_table is not None:
-            stored_cpu, padded_cpu, comp_idx_cpu = cpu_table
-            # Copy the raw chunks into place; nvCOMP decodes the ANS chunks into their slots.
-            # The copy tables are built on the CPU, from a small copy of the blob's chunk table.
-            is_raw = torch.ones(total, dtype=torch.bool, device="cpu")
-            is_raw[comp_idx_cpu] = False
-            src_cpu = x.data_ptr() + data_off + (torch.cumsum(padded_cpu, 0) - padded_cpu)
-            raw_src = src_cpu[is_raw]
-            raw_dst = torch.arange(
-                planar_base,
-                planar_base + total * chunk_bytes,
-                chunk_bytes,
-                dtype=torch.int64,
-                device="cpu",
-            )[is_raw]
-            raw_size = padded_cpu[is_raw]
-            if raw_size.numel():
-                # One copy per run of raw chunks that are back to back in both the blob and the output.
-                head = torch.ones(raw_size.numel(), dtype=torch.bool, device="cpu")
-                head[1:] = raw_src[:-1] + raw_size[:-1] != raw_src[1:]
-                last = head.roll(-1)
-                _cudart.memcpy_batch(
-                    raw_dst[head],
-                    raw_src[head],
-                    raw_dst[last] + raw_size[last] - raw_dst[head],
-                    stream,
-                )
+        if k == 1:
+            # nvCOMP decodes the ANS chunks into their slots; copy the raw chunks into theirs.
+            raw_only = raw.index_fill(0, comp_idx, 0)
+            _kernels.copy_chunks(src, slots, raw_only, chunk_bytes, pad=False)
         else:
             # Each stream's chunk comes from the planar buffer if ANS-decoded, else straight from the blob.
             tbl = src.index_copy(0, comp_idx, slots[comp_idx]) - planar_base
