@@ -67,6 +67,7 @@ CRC-32 of each `checksum_chunk_bytes`-byte chunk of any tensor's bytes, computed
 ```python
 blob, crc = compress_tensor_with_crc32(t)
 ...
+blob = blob.cuda()
 if not torch.equal(hash_tensor_with_crc32(blob), crc):
     raise ValueError("corrupted blob")
 out = decompress_tensor(blob)
@@ -74,8 +75,4 @@ out = decompress_tensor(blob)
 
 ## Blob format
 
-The layout is documented in [`_codec.py`](src/cuzipnn/_codec.py). Blobs carry a format version, and `decompress_tensor` rejects blobs from other versions. The format is not compatible with the original ZipNN.
-
-## License
-
-[Unlicense](LICENSE)
+The layout is documented in `_codec.py`. Blobs carry a format version, and `decompress_tensor` rejects blobs from other versions. The format is not compatible with the original ZipNN.
