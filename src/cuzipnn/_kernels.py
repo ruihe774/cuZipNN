@@ -121,8 +121,11 @@ def _copy_chunks_kernel(src_tbl, dst_tbl, nbytes_ptr, PAD: tl.constexpr, BLOCK: 
         nw = nb // 16 * 2
         w = t * BLOCK + tl.arange(0, BLOCK)
         m = w < nw
-        v = tl.load(src.to(tl.pointer_type(tl.uint64)) + w, mask=m)
-        tl.store(dst.to(tl.pointer_type(tl.uint64)) + w, v, mask=m)
+        # The hint must go on the uint64 pointers; one on the integer address is lost in the cast.
+        src64 = tl.multiple_of(src.to(tl.pointer_type(tl.uint64)), 16)
+        dst64 = tl.multiple_of(dst.to(tl.pointer_type(tl.uint64)), 16)
+        v = tl.load(src64 + w, mask=m)
+        tl.store(dst64 + w, v, mask=m)
         if (nb > nw * 8) & (t == nw // BLOCK):
             k = nw * 8 + tl.arange(0, 16)
             b = tl.load(src.to(tl.pointer_type(tl.uint8)) + k, mask=k < nb, other=0)
@@ -186,4 +189,5 @@ def copy_chunks(
 ) -> None:
     """src_tbl/dst_tbl hold int64 device addresses; a chunk with nbytes 0 is skipped."""
     grid = (src_tbl.numel(), triton.cdiv(max_bytes, 8 * _COPY_BLOCK))
+    # 8 words per thread; BLOCK 256-2048 x 1-16 warps are all within ~4% of this on GB10.
     _copy_chunks_kernel[grid](src_tbl, dst_tbl, nbytes, PAD=pad, BLOCK=_COPY_BLOCK, num_warps=4)  # pyright: ignore[reportCallIssue]
