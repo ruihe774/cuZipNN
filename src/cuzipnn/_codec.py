@@ -93,8 +93,24 @@ def _layout(ndim: int, total: int, n_comp: int) -> tuple[int, int, int]:
     return sizes_off, idx_off, data_off
 
 
-def _gpu(x: torch.Tensor) -> torch.device:
-    return x.device if x.is_cuda else torch.device("cuda", torch.cuda.current_device())
+def _check_device(compute_device: torch.device | str | None) -> torch.device | None:
+    """Validate compute_device without initializing CUDA."""
+    if compute_device is None:
+        return None
+    device = torch.device(compute_device)
+    if device.type != "cuda":
+        raise ValueError(f"compute_device must be a CUDA device, not {device}")
+    return device
+
+
+def _gpu(x: torch.Tensor, compute_device: torch.device | None) -> torch.device:
+    """compute_device if given, else x's device if it is on the GPU, else the current CUDA device."""
+    device = compute_device
+    if device is None:
+        device = x.device if x.is_cuda else torch.device("cuda")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
 
 
 def _crc32(data: torch.Tensor, checksum_chunk_bytes: int) -> torch.Tensor:
@@ -139,8 +155,10 @@ def compress_tensor(
     passthrough_threshold: float = DEFAULT_PASSTHROUGH_THRESHOLD,
     min_compress_bytes: int = DEFAULT_MIN_COMPRESS_BYTES,
     pin_memory: bool = False,
+    compute_device: torch.device | str | None = None,
+    readback_to_cpu: bool = True,
 ) -> torch.Tensor:
-    """Compress a tensor losslessly on the GPU; returns a 1-D uint8 tensor in CPU memory."""
+    """Compress a tensor losslessly on the GPU; returns a 1-D uint8 tensor."""
     blob, _ = _compress(
         tensor,
         chunk_bytes=chunk_bytes,
@@ -149,6 +167,8 @@ def compress_tensor(
         min_compress_bytes=min_compress_bytes,
         checksum_chunk_bytes=None,
         pin_memory=pin_memory,
+        compute_device=compute_device,
+        readback_to_cpu=readback_to_cpu,
     )
     return blob
 
@@ -162,9 +182,11 @@ def compress_tensor_with_crc32(
     min_compress_bytes: int = DEFAULT_MIN_COMPRESS_BYTES,
     checksum_chunk_bytes: int = DEFAULT_CHECKSUM_CHUNK_BYTES,
     pin_memory: bool = False,
+    compute_device: torch.device | str | None = None,
+    readback_to_cpu: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """compress_tensor, plus the CRC-32 (as zlib.crc32) of each checksum_chunk_bytes-byte chunk
-    of the blob, the last one possibly shorter, as a 1-D uint32 tensor in CPU memory.
+    of the blob, the last one possibly shorter, as a 1-D uint32 tensor on the blob's device.
 
     The blob is the same as compress_tensor's. The checksums are computed on the GPU before the
     blob is copied back (on the CPU for tensors below min_compress_bytes, which are stored
@@ -179,6 +201,8 @@ def compress_tensor_with_crc32(
         min_compress_bytes=min_compress_bytes,
         checksum_chunk_bytes=checksum_chunk_bytes,
         pin_memory=pin_memory,
+        compute_device=compute_device,
+        readback_to_cpu=readback_to_cpu,
     )
     assert checksums is not None
     return blob, checksums
@@ -188,17 +212,20 @@ def hash_tensor_with_crc32(
     tensor: torch.Tensor,
     *,
     checksum_chunk_bytes: int = DEFAULT_CHECKSUM_CHUNK_BYTES,
+    compute_device: torch.device | str | None = None,
+    readback_to_cpu: bool = True,
 ) -> torch.Tensor:
     """CRC-32 (as zlib.crc32) of each checksum_chunk_bytes-byte chunk of the tensor's bytes in
     row-major order, the last one possibly shorter, computed on the GPU. Returns a 1-D uint32
-    tensor in CPU memory."""
+    tensor."""
     if checksum_chunk_bytes <= 0:
         raise ValueError("checksum_chunk_bytes must be positive")
     x = tensor.detach()
-    device = _gpu(x)
+    device = _gpu(x, _check_device(compute_device))
     with torch.cuda.device(device):
         x = x.to(device, non_blocking=True, memory_format=torch.contiguous_format).contiguous()
-        return _crc32(x.view(-1).view(torch.uint8), checksum_chunk_bytes).cpu()
+        crc = _crc32(x.view(-1).view(torch.uint8), checksum_chunk_bytes)
+        return crc.cpu() if readback_to_cpu else crc
 
 
 def _compress(
@@ -210,7 +237,12 @@ def _compress(
     min_compress_bytes: int,
     checksum_chunk_bytes: int | None,
     pin_memory: bool,
+    compute_device: torch.device | str | None,
+    readback_to_cpu: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    compute_device = _check_device(compute_device)
+    if pin_memory and not readback_to_cpu:
+        raise ValueError("pin_memory requires readback_to_cpu")
     if tensor.dtype not in _CODES:
         raise TypeError(f"unsupported dtype {tensor.dtype}")
     if chunk_bytes % 8 or not 0 < chunk_bytes <= _nvcomp.MAX_CHUNK_BYTES:
@@ -259,16 +291,21 @@ def _compress(
         shape_spec.pack_into(b, _FIXED.size, *tensor.shape)
         return r
 
-    if n * k < min_compress_bytes:
+    if n * k < min_compress_bytes or n == 0:
+        stored = n * k < min_compress_bytes
         header_size = _FIXED.size + 8 * tensor.dim()
-        blob = header(0, size=header_size + n * k, stored=True)
-        return _fill_stored(blob, header_size, x, checksum_chunk_bytes)
+        if readback_to_cpu:
+            blob = header(0, size=header_size + n * k, stored=stored)
+            return _fill_stored(blob, header_size, x, checksum_chunk_bytes)
+        device = _gpu(x, compute_device)
+        with torch.cuda.device(device):
+            blob = torch.empty(header_size + n * k, dtype=torch.uint8, device=device)
+            blob[:header_size].copy_(header(0, stored=stored))
+            blob[header_size:].view(x.dtype).view(x.shape).copy_(x)
+            crc = None if checksum_chunk_bytes is None else _crc32(blob, checksum_chunk_bytes)
+            return blob, crc
 
-    if n == 0:
-        blob = header(0)
-        return _fill_stored(blob, blob.numel(), x, checksum_chunk_bytes)
-
-    device = _gpu(x)
+    device = _gpu(x, compute_device)
     with torch.cuda.device(device):
         x = (
             x.to(device, non_blocking=True, memory_format=torch.contiguous_format)
@@ -368,6 +405,8 @@ def _compress(
         crc = None
         if checksum_chunk_bytes is not None:
             crc = _crc32(comp[:size], checksum_chunk_bytes)
+        if not readback_to_cpu:
+            return comp[:size], crc
         blob = _populated_empty(size, pin_memory=pin_memory)
         # With a crc, crc.cpu() below syncs the stream, so blob is complete on return.
         blob.copy_(comp[:size], non_blocking=crc is not None)
@@ -390,15 +429,16 @@ def _parse_header(
 
 
 def decompress_tensor(
-    blob: torch.Tensor, *, device: torch.device | str | int | None = None
+    blob: torch.Tensor,
+    *,
+    compute_device: torch.device | str | None = None,
+    readback_to_cpu: bool = False,
 ) -> torch.Tensor:
     """Decompress a blob produced by compress_tensor; the blob may be on the CPU or the GPU.
 
-    The result is placed on `device` (default: the blob's device if it is on the GPU, else the current CUDA device).
-    Decoding always runs on the GPU; a non-CUDA `device` such as "cpu" receives a copy of the result.
-
     Passing a blob that is not from `compress_tensor` results in undefined behavior.
     """
+    compute_device = _check_device(compute_device)
     if blob.dtype != torch.uint8 or blob.dim() != 1:
         raise ValueError("blob must be a 1-D uint8 tensor")
 
@@ -411,34 +451,24 @@ def decompress_tensor(
     dtype, shape, flags, chunk_bytes, n_comp, n = _parse_header(prefix)
     reorder = bool(flags & _FLAG_REORDER)
 
-    device = (
-        torch.device(device)
-        if device is not None
-        else blob.device
-        if blob.is_cuda
-        else torch.device("cuda", torch.cuda.current_device())
-    )
-
     if flags & _FLAG_STORED:
         # Stored uncompressed: copy the bytes after the header straight to the target device.
         header_size = _FIXED.size + 8 * len(shape)
         nbytes = math.prod(shape) * dtype.itemsize
         if blob.numel() < header_size + nbytes:
             raise ValueError("blob is truncated")
-        if device.type == "cpu":
+        if readback_to_cpu:
             out = _populated_empty(nbytes).view(dtype).view(shape)
         else:
-            out = torch.empty(shape, dtype=dtype, device=device)
+            out = torch.empty(shape, dtype=dtype, device=_gpu(blob, compute_device))
         out.view(-1).view(torch.uint8).copy_(blob[header_size : header_size + nbytes])
         return out
 
-    # Decode on the GPU regardless; a non-CUDA target gets a copy at the end.
-    out_device = device
-    if device.type != "cuda":
-        device = torch.device("cuda", torch.cuda.current_device())
-
     if n == 0:
-        return torch.empty(shape, dtype=dtype, device=out_device)
+        return torch.empty(
+            shape, dtype=dtype, device="cpu" if readback_to_cpu else _gpu(blob, compute_device)
+        )
+    device = _gpu(blob, compute_device)
     out = torch.empty(shape, dtype=dtype, device=device)
 
     k = out.element_size()
@@ -502,23 +532,18 @@ def decompress_tensor(
         if uploaded is not None:
             uploaded.synchronize()
 
-        if out_device.type == "cpu":
+        if readback_to_cpu:
             src = out
             out = (
-                _populated_empty(src.numel() * src.element_size(), device=out_device)
-                .view(src.dtype)
-                .view_as(src)
+                _populated_empty(src.numel() * src.element_size()).view(src.dtype).view_as(src)
             )
             out.copy_(src)
 
-        return out.to(out_device)
+        return out
 
 
-def _populated_empty(
-    size: int, *, pin_memory: bool = False, device: torch.device | str = "cpu"
-) -> torch.Tensor:
-    device = torch.device(device)
-    t = torch.empty(size, dtype=torch.uint8, device=device, pin_memory=pin_memory)
+def _populated_empty(size: int, *, pin_memory: bool = False) -> torch.Tensor:
+    t = torch.empty(size, dtype=torch.uint8, pin_memory=pin_memory)
     if not pin_memory:
         # There are other page sizes, but all >= 4KB.
         t[::4096].fill_(1)

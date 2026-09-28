@@ -159,7 +159,7 @@ def test_decompress_to_cpu(n):
     x = _weights(torch.bfloat16, n)
     blob = compress_tensor(x, chunk_bytes=CHUNK)
     for b in (blob, blob.cuda()):
-        y = decompress_tensor(b, device="cpu")
+        y = decompress_tensor(b, readback_to_cpu=True)
         assert y.device.type == "cpu" and y.shape == x.shape
 
 
@@ -171,7 +171,7 @@ def test_decompress_0dim_to_cpu(dtype, min_compress_bytes):
     blob = compress_tensor(x, min_compress_bytes=min_compress_bytes)
     assert _is_stored(blob) == (min_compress_bytes > 0)
     for b in (blob, blob.cuda()):
-        y = decompress_tensor(b, device="cpu")
+        y = decompress_tensor(b, readback_to_cpu=True)
         assert y.device.type == "cpu" and y.dtype == dtype and y.shape == ()
         assert torch.equal(_bits(y), _bits(x).cpu())
         assert torch.equal(_bits(x.cpu()), _bits(y))
@@ -381,7 +381,7 @@ def test_stored_roundtrip(dtype, shape):
     blob = _assert_roundtrip(x, min_compress_bytes=nbytes + 1)
     assert _is_stored(blob)
     assert blob.numel() == _codec._FIXED.size + 8 * len(shape) + nbytes
-    y = decompress_tensor(blob, device="cpu")
+    y = decompress_tensor(blob, readback_to_cpu=True)
     assert y.device.type == "cpu" and torch.equal(_bits(y), _bits(x.cpu()))
 
 
@@ -505,6 +505,55 @@ def test_crc32_non_default_stream():
         blob, crc = compress_tensor_with_crc32(x, chunk_bytes=CHUNK)
         assert torch.equal(hash_tensor_with_crc32(blob), crc)
     assert torch.equal(blob, ref[0]) and torch.equal(crc, ref[1])
+
+
+@pytest.mark.parametrize("n", [0, 7, 100_000])
+@pytest.mark.parametrize("cpu_input", [False, True])
+def test_no_readback(n, cpu_input):
+    # n = 7 is stored uncompressed, n = 0 is an empty blob; both still end up on the GPU.
+    x = _weights(torch.bfloat16, n, device="cpu" if cpu_input else "cuda")
+    kw: dict = {"chunk_bytes": CHUNK}
+    ref, ref_crc = compress_tensor_with_crc32(x, **kw)
+    blob = compress_tensor(x, readback_to_cpu=False, **kw)
+    gblob, crc = compress_tensor_with_crc32(x, readback_to_cpu=False, **kw)
+    for t in (blob, gblob, crc):
+        assert t.is_cuda and t.device.index == torch.cuda.current_device()
+    assert torch.equal(blob.cpu(), ref) and torch.equal(gblob.cpu(), ref)
+    assert torch.equal(crc.cpu(), ref_crc)
+    h = hash_tensor_with_crc32(ref, readback_to_cpu=False)
+    assert h.is_cuda and torch.equal(h.cpu(), ref_crc)
+    y = decompress_tensor(ref)
+    assert y.is_cuda and torch.equal(_bits(y), _bits(x.cuda()))
+    for b in (ref, blob):
+        y = decompress_tensor(b, readback_to_cpu=True, compute_device="cuda")
+        assert not y.is_cuda and torch.equal(_bits(y), _bits(x.cpu()))
+
+
+def test_compute_device():
+    x = _weights(torch.bfloat16, 100_000, device="cpu")
+    dev = f"cuda:{torch.cuda.current_device()}"
+    blob, crc = compress_tensor_with_crc32(x, compute_device=dev, readback_to_cpu=False)
+    assert str(blob.device) == dev and str(crc.device) == dev
+    assert (
+        str(hash_tensor_with_crc32(x, compute_device=dev, readback_to_cpu=False).device) == dev
+    )
+    assert str(decompress_tensor(blob.cpu(), compute_device=dev).device) == dev
+
+
+@pytest.mark.parametrize("compute_device", ["cpu", torch.device("meta")])
+def test_bad_compute_device(compute_device):
+    x = _weights(torch.bfloat16, 100)
+    blob = compress_tensor(x)
+    for f in (compress_tensor, compress_tensor_with_crc32, hash_tensor_with_crc32):
+        with pytest.raises(ValueError, match="compute_device"):
+            f(x, compute_device=compute_device)
+    with pytest.raises(ValueError, match="compute_device"):
+        decompress_tensor(blob, compute_device=compute_device)
+
+
+def test_pin_memory_requires_readback():
+    with pytest.raises(ValueError, match="pin_memory"):
+        compress_tensor(_weights(torch.bfloat16, 100), pin_memory=True, readback_to_cpu=False)
 
 
 @pytest.mark.parametrize("checksum_chunk_bytes", [0, -1])

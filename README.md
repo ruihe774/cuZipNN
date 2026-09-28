@@ -18,7 +18,7 @@ from cuzipnn import compress_tensor, decompress_tensor
 
 t = torch.randn(4096, 4096, dtype=torch.float32, device="cuda")
 blob = compress_tensor(t)  # 1-D uint8 tensor in CPU memory
-out = decompress_tensor(blob, device="cuda")
+out = decompress_tensor(blob)  # on the GPU
 assert torch.equal(out, t)
 ```
 
@@ -40,27 +40,34 @@ Measured on an NVIDIA GB10 (DGX Spark: 20-core Grace CPU with memory shared with
 
 ## API
 
-### `compress_tensor(tensor, *, chunk_bytes=131072, sub_chunk_bytes=8192, passthrough_threshold=0.95, min_compress_bytes=65536, pin_memory=False) -> Tensor`
+All functions take two keyword arguments that decide where the work happens and where the result goes:
 
-Compresses `tensor` (CPU or CUDA) on the GPU and returns the blob as a 1-D `uint8` CPU tensor.
+- `compute_device`: the CUDA device to run on. The default is the input's device if it is on a GPU, else the current CUDA device. A non-CUDA device raises `ValueError`.
+- `readback_to_cpu`: copy the result to CPU memory. Otherwise it stays on `compute_device`, without an extra copy. Defaults to `True` for compression and hashing, `False` for decompression.
+
+### `compress_tensor(tensor, *, chunk_bytes=131072, sub_chunk_bytes=8192, passthrough_threshold=0.95, min_compress_bytes=65536, pin_memory=False, compute_device=None, readback_to_cpu=True) -> Tensor`
+
+Compresses `tensor` (CPU or CUDA) on the GPU and returns the blob as a 1-D `uint8` tensor.
 
 - `chunk_bytes`: elements per independently coded chunk; a multiple of 8, at most 16 MiB.
 - `sub_chunk_bytes`: target size of nvCOMP's ANS sub-chunks. Larger compresses slightly better; smaller decodes with more parallelism.
 - `passthrough_threshold`: a chunk stays compressed only if it shrinks below this fraction of its raw size; otherwise it is stored raw. In `(0, 1]`.
-- `min_compress_bytes`: tensors smaller than this are stored uncompressed.
-- `pin_memory`: return the blob in pinned memory.
+- `min_compress_bytes`: tensors smaller than this are stored uncompressed. With `readback_to_cpu`, they are copied straight to CPU memory without going through the GPU.
+- `pin_memory`: return the blob in pinned memory. Requires `readback_to_cpu`.
 
-### `decompress_tensor(blob, *, device=None) -> Tensor`
+With `readback_to_cpu=False`, the blob is a view into the GPU buffer it was packed in, which is at least as large as the input: clone it to release the rest.
 
-Decompresses a blob (on CPU or GPU) back into a tensor on `device`. The default is the blob's device if it is on a GPU, else the current CUDA device. Decoding always runs on the GPU; `device="cpu"` gets a copy of the result.
+### `decompress_tensor(blob, *, compute_device=None, readback_to_cpu=False) -> Tensor`
+
+Decompresses a blob (on CPU or GPU) back into a tensor, on `compute_device` by default or in CPU memory with `readback_to_cpu=True`.
 
 Passing a blob that was not produced by `compress_tensor` is undefined behavior. Verify untrusted blobs with the CRC-32 functions below first.
 
 ### `compress_tensor_with_crc32(tensor, *, ..., checksum_chunk_bytes=16384) -> (Tensor, Tensor)`
 
-Same as `compress_tensor` (same arguments, same blob), and also returns the CRC-32 of every `checksum_chunk_bytes`-byte chunk of the blob (the last one may be shorter) as a 1-D `uint32` CPU tensor. The checksums are computed on the GPU and match `zlib.crc32`.
+Same as `compress_tensor` (same arguments, same blob), and also returns the CRC-32 of every `checksum_chunk_bytes`-byte chunk of the blob (the last one may be shorter) as a 1-D `uint32` tensor, on the same device as the blob. The checksums match `zlib.crc32`.
 
-### `hash_tensor_with_crc32(tensor, *, checksum_chunk_bytes=16384) -> Tensor`
+### `hash_tensor_with_crc32(tensor, *, checksum_chunk_bytes=16384, compute_device=None, readback_to_cpu=True) -> Tensor`
 
 CRC-32 of each `checksum_chunk_bytes`-byte chunk of any tensor's bytes, computed on the GPU. Applied to a blob, it reproduces the checksums from `compress_tensor_with_crc32`:
 

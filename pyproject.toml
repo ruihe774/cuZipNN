@@ -1,6 +1,6 @@
 [project]
 name = "cuzipnn"
-version = "0.1.0"
+version = "0.2.0"
 description = "GPU implementation of ZipNN lossless tensor compression, using Triton and nvCOMP"
 readme = "README.md"
 requires-python = ">=3.12"
