@@ -194,7 +194,7 @@ def test_deterministic():
 
 def test_deterministic_despite_stale_device_memory():
     # nvCOMP's rANS leaves some bytes within comp_bytes unwritten, and each stream's last chunk
-    # (2307 bytes here, stored raw for the mantissa stream) is copied through to its 8-byte
+    # (2307 bytes here, stored raw for the mantissa stream) is copied through to its 16-byte
     # boundary; neither may pick up stale memory.
     x = _weights(torch.bfloat16, 4_000_003)
     blobs = []
@@ -207,7 +207,7 @@ def test_deterministic_despite_stale_device_memory():
 
 
 def test_deterministic_despite_bytes_past_view():
-    # A single-byte tensor is copied straight from its own memory, through to the 8-byte boundary.
+    # A single-byte tensor is copied straight from its own memory, through to the 16-byte boundary.
     base = torch.randint(0, 256, (CHUNK + 16,), dtype=torch.uint8, device="cuda")
     x = base[: CHUNK + 3]
     blobs = []
@@ -265,6 +265,29 @@ def test_larger_sub_chunks_compress_better():
     x = _weights(torch.bfloat16, 2_000_000)
     small, large = (compress_tensor(x, sub_chunk_bytes=s).numel() for s in (2 << 10, 32 << 10))
     assert large < small
+
+
+@pytest.mark.parametrize("chunk_bytes", [0, 8, CHUNK + 8, (1 << 24) + 16])
+def test_bad_chunk_bytes(chunk_bytes):
+    with pytest.raises(ValueError, match="chunk_bytes"):
+        compress_tensor(_weights(torch.bfloat16, 100), chunk_bytes=chunk_bytes)
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("ndim", [1, 2])
+def test_chunks_16_byte_aligned(dtype, ndim):
+    # Odd-sized last chunks, and a mix of ANS and raw chunks, must not shift any chunk off 16 bytes.
+    x = _mixed_int8(7).view(dtype) if dtype == torch.int8 else _weights(dtype, 10 * CHUNK + 13)
+    x = x.reshape(1, -1) if ndim == 2 else x
+    blob = _assert_roundtrip(x, chunk_bytes=CHUNK)
+    k, nch = x.element_size(), math.ceil(x.numel() / CHUNK)
+    n_comp = int(blob[12:16].view(torch.int32))
+    assert 0 < n_comp < k * nch
+    sizes_off, idx_off, data_off = _codec._layout(ndim, k * nch, n_comp)
+    stored = blob[sizes_off:idx_off].view(torch.int32).tolist()
+    assert data_off % 16 == 0 and not blob[idx_off + 4 * n_comp : data_off].any()
+    assert any(s % 16 for s in stored)
+    assert blob.numel() == data_off + sum(-(-s // 16) * 16 for s in stored)
 
 
 def test_bad_sub_chunk_bytes():

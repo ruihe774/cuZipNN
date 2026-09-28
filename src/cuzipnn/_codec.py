@@ -1,6 +1,6 @@
 """ZipNN on the GPU: bit reordering and byte grouping in Triton, entropy coding with nvCOMP ANS.
 
-Blob layout (little-endian, every section 8-byte aligned):
+Blob layout (little-endian):
 
     0   magic "ZNNG" | u8 version | u8 dtype code | u8 ndim | u8 flags
     8   u32 chunk_bytes | u32 n_comp
@@ -14,9 +14,10 @@ header is followed directly by the tensor's bytes in row-major order. Otherwise 
 
     ..  i32 stored_bytes[K * nch]  bytes stored for each (stream, chunk), ANS-compressed or raw
     ..  i32 comp_idx[n_comp]       indices of the ANS-compressed chunks
-    ..  data                       chunks in (stream, chunk) order, each padded to 8 bytes
+    ..  data                       chunks in (stream, chunk) order, each zero-padded to 16 bytes
 
-K is the element size in bytes (one stream per byte), and nch = ceil(numel / chunk_bytes).
+data starts at a 16-byte aligned offset (zero-filled after comp_idx), so every chunk is 16-byte
+aligned. K is the element size in bytes (one stream per byte), and nch = ceil(numel / chunk_bytes).
 Chunk j of every stream covers elements [j * chunk_bytes, (j + 1) * chunk_bytes).
 """
 
@@ -32,7 +33,7 @@ import triton
 from . import _kernels, _nvcomp
 
 _MAGIC = b"ZNNG"
-_VERSION = 2
+_VERSION = 3
 _FIXED = struct.Struct("<4sBBBBIIQ")
 _FLAG_REORDER = 1
 _FLAG_STORED = 2
@@ -67,8 +68,8 @@ _CODES = {dtype: code for code, dtype in _DTYPES.items()}
 _REORDER = {torch.bfloat16, torch.float32}
 
 
-def _align8[T: (int, torch.Tensor)](x: T) -> T:
-    return (x + 7) & ~7
+def _align16[T: (int, torch.Tensor)](x: T) -> T:
+    return (x + 15) & ~15
 
 
 def _raw_bytes(
@@ -89,7 +90,7 @@ def _sub_chunks(chunk_bytes: int, sub_chunk_bytes: int) -> int:
 def _layout(ndim: int, total: int, n_comp: int) -> tuple[int, int, int]:
     sizes_off = 24 + 8 * ndim
     idx_off = sizes_off + 4 * total
-    data_off = _align8(idx_off + 4 * n_comp)
+    data_off = _align16(idx_off + 4 * n_comp)
     return sizes_off, idx_off, data_off
 
 
@@ -213,9 +214,10 @@ def _compress(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if tensor.dtype not in _CODES:
         raise TypeError(f"unsupported dtype {tensor.dtype}")
-    if chunk_bytes % 8 or not 0 < chunk_bytes <= _nvcomp.MAX_CHUNK_BYTES:
+    # Keeps every chunk of the planar buffer 16-byte aligned.
+    if chunk_bytes % 16 or not 0 < chunk_bytes <= _nvcomp.MAX_CHUNK_BYTES:
         raise ValueError(
-            f"chunk_bytes must be a multiple of 8 in (0, {_nvcomp.MAX_CHUNK_BYTES}]"
+            f"chunk_bytes must be a multiple of 16 in (0, {_nvcomp.MAX_CHUNK_BYTES}]"
         )
     if passthrough_threshold <= 0 or passthrough_threshold > 1:
         raise ValueError("passthrough_threshold must be in (0, 1]")
@@ -279,7 +281,7 @@ def _compress(
         # Bit reordering + byte grouping into K contiguous streams of nch chunks each.
         if k == 1:
             planar = x.view(torch.uint8)
-            if planar.data_ptr() % 8:
+            if planar.data_ptr() % 16:
                 planar = planar.clone()
         else:
             planar = torch.empty(total * chunk_bytes, dtype=torch.uint8, device=device)
@@ -294,10 +296,10 @@ def _compress(
             dtype=torch.int64,
             device=device,
         )
-        slot = _align8(_nvcomp.max_compressed_chunk_bytes(chunk_bytes, sub_chunks))
+        slot = _align16(_nvcomp.max_compressed_chunk_bytes(chunk_bytes, sub_chunks))
         # The blob is packed into this buffer at the end. Stored chunks are never larger than
         # raw ones, so it also fits the header and tables.
-        head = _align8(24 + 8 * tensor.dim() + 8 * total)
+        head = _align16(24 + 8 * tensor.dim() + 8 * total)
         # Zeroed: nvCOMP's rANS leaves some bytes within comp_bytes unwritten, which would
         # otherwise leak stale device memory into the blob and make it non-deterministic.
         comp = torch.zeros(
@@ -329,7 +331,7 @@ def _compress(
         ).to("cpu")
         use = comp_bytes < threshold_bytes
         stored = torch.where(use, comp_bytes, raw_bytes)
-        padded = _align8(stored)
+        padded = _align16(stored)
         ends = torch.cumsum(padded, 0)
         comp_idx = use.nonzero().view(-1)
         n_comp = comp_idx.numel()
@@ -350,7 +352,7 @@ def _compress(
         out_ptrs = torch.arange(out_start, out_start + total * slot, slot, dtype=torch.int64)
         comp_stored = torch.where(use, stored, 0)
         if in_start == tensor.data_ptr():
-            comp_padded = _align8(comp_stored)
+            comp_padded = _align16(comp_stored)
             temp = torch.empty(int(comp_padded.sum()), dtype=torch.uint8, device=device)
             home = temp.data_ptr() + torch.cumsum(comp_padded, 0) - comp_padded
         else:
@@ -452,7 +454,7 @@ def decompress_tensor(
         x = blob.to(
             device, non_blocking=True, memory_format=torch.contiguous_format
         ).contiguous()
-        if x.data_ptr() % 8:
+        if x.data_ptr() % 16:
             x = x.clone()
         # A pinned blob is uploaded asynchronously, but the caller may reuse it once we return.
         uploaded = torch.cuda.Event() if blob.is_pinned() else None
@@ -461,7 +463,7 @@ def decompress_tensor(
 
         stored = x[sizes_off:idx_off].view(torch.int32).to(torch.int64)
         comp_idx = x[idx_off : idx_off + 4 * n_comp].view(torch.int32).to(torch.int64)
-        padded = _align8(stored)
+        padded = _align16(stored)
         src = x.data_ptr() + data_off + (torch.cumsum(padded, 0) - padded)
         raw = _raw_bytes(k, nch, n, chunk_bytes, 1, device)
 

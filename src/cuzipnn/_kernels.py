@@ -70,8 +70,8 @@ def _merge_streams(
 ):
     u = tl.zeros(offs.shape, WT)
     for b in tl.static_range(K):  # pyright: ignore[reportGeneralTypeIssues]
-        # Every chunk starts 8-byte aligned; the hint lets Triton vectorize the byte loads.
-        src = base_ptr + tl.multiple_of(tl.load(src_tbl + b * nch + j), 8)
+        # Every chunk starts 16-byte aligned; the hint lets Triton vectorize the byte loads.
+        src = base_ptr + tl.multiple_of(tl.load(src_tbl + b * nch + j), 16)
         u |= tl.load(src + offs, mask=mask, other=0).to(WT) << (8 * b)
     if REORDER:
         u = _revert(u, 8 * K)
@@ -107,9 +107,9 @@ def _merge_kernel(
 
 @triton.jit
 def _copy_chunks_kernel(src_tbl, dst_tbl, nbytes_ptr, PAD: tl.constexpr, BLOCK: tl.constexpr):
-    """Copy chunk i (nbytes[i] bytes) from src_tbl[i] to dst_tbl[i]; both addresses are 8-byte aligned.
+    """Copy chunk i (nbytes[i] bytes) from src_tbl[i] to dst_tbl[i]; both addresses are 16-byte aligned.
 
-    With PAD, the destination is zero-filled up to the next multiple of 8 bytes.
+    With PAD, the destination is zero-filled up to the next multiple of 16 bytes.
     """
     i = tl.program_id(0)
     t = tl.program_id(1)
@@ -117,13 +117,14 @@ def _copy_chunks_kernel(src_tbl, dst_tbl, nbytes_ptr, PAD: tl.constexpr, BLOCK: 
     if t * BLOCK * 8 < nb:
         src = tl.load(src_tbl + i)
         dst = tl.load(dst_tbl + i)
-        nw = nb // 8
+        # Whole 16-byte units as pairs of words; the rest, up to 15 bytes, byte by byte.
+        nw = nb // 16 * 2
         w = t * BLOCK + tl.arange(0, BLOCK)
         m = w < nw
         v = tl.load(src.to(tl.pointer_type(tl.uint64)) + w, mask=m)
         tl.store(dst.to(tl.pointer_type(tl.uint64)) + w, v, mask=m)
         if (nb > nw * 8) & (t == nw // BLOCK):
-            k = nw * 8 + tl.arange(0, 8)
+            k = nw * 8 + tl.arange(0, 16)
             b = tl.load(src.to(tl.pointer_type(tl.uint8)) + k, mask=k < nb, other=0)
             if PAD:
                 tl.store(dst.to(tl.pointer_type(tl.uint8)) + k, b)
@@ -155,7 +156,7 @@ def merge(
     chunk_bytes: int,
     reorder: bool,
 ) -> None:
-    """src_tbl holds int64 byte offsets from base.data_ptr(), each a multiple of 8."""
+    """src_tbl holds int64 byte offsets from base.data_ptr(), each a multiple of 16."""
     n = out.numel()
     k = out.element_size()
     nch = triton.cdiv(n, chunk_bytes)

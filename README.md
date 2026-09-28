@@ -44,7 +44,7 @@ Measured on an NVIDIA GB10 (DGX Spark: 20-core Grace CPU with memory shared with
 
 Compresses `tensor` (CPU or CUDA) on the GPU and returns the blob as a 1-D `uint8` CPU tensor.
 
-- `chunk_bytes`: elements per independently coded chunk; a multiple of 8, at most 16 MiB.
+- `chunk_bytes`: elements per independently coded chunk; a multiple of 16, at most 16 MiB.
 - `sub_chunk_bytes`: target size of nvCOMP's ANS sub-chunks. Larger compresses slightly better; smaller decodes with more parallelism.
 - `passthrough_threshold`: a chunk stays compressed only if it shrinks below this fraction of its raw size; otherwise it is stored raw. In `(0, 1]`.
 - `min_compress_bytes`: tensors smaller than this are stored uncompressed.
